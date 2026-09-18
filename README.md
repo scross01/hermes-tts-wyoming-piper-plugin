@@ -1,13 +1,29 @@
 # TTS Wyoming Piper Plugin
 
-A Hermes TTS plugin that connects to remote Piper TTS services via Wyoming Protocol.
+A [Hermes Agent](https://github.com/NousResearch/hermes-agent) TTS plugin that connects to remote [Piper](https://github.com/OHF-Voice/wyoming-piper) TTS services via [Wyoming Protocol](https://github.com/OHF-Voice/wyoming).
+
+## Background
+
+[Wyoming Protocol](https://github.com/OHF-Voice/wyoming) is a peer-to-peer TCP protocol for voice assistants, created by the [Open Home Foundation](https://www.openhomefoundation.org/) (the team behind Home Assistant and Rhasspy). It enables real-time streaming of audio and voice events between services — originally designed for local voice pipelines in Home Assistant.
+
+[Piper](https://github.com/OHF-Voice/wyoming-piper) is a fast, local neural text-to-speech engine that speaks Wyoming Protocol. It runs entirely on CPU, supports 44 languages with pre-trained voices, and needs no API key.
+
+Most people use Wyoming Piper through Home Assistant's voice pipeline. This plugin bridges a different path: **Hermes Agent → Wyoming Protocol → Piper on a remote server**. This is useful when you want your AI agent to speak through a Piper instance running on another machine (a Raspberry Pi, a home server, etc.) without Home Assistant in the loop.
+
+### Who is this for?
+
+- **Home lab tinkerers** running Piper on a Raspberry Pi or dedicated server who want their Hermes agent to use it
+- **Privacy-focused users** who want TTS without cloud APIs — Piper runs entirely offline
+- **Multi-device setups** where Piper serves multiple clients (Home Assistant, Hermes, custom tools) on the same network
+- **Existing Wyoming Piper users** who want to add Hermes voice output to their setup
 
 ## Features
 
 - Connect to any Wyoming-compatible Piper server
-- Query available voices automatically
+- Query available voices automatically (174+ voices across 44 languages)
 - Voice selection via config or per-request
 - Voice bubble support (Telegram, Discord)
+- Warm-up and connection reuse for fast repeated synthesis
 
 ## Installation
 
@@ -42,6 +58,13 @@ plugins:
         voice: en_US-lessac-medium
         timeout: 10
 ```
+
+| Setting | Description | Default |
+|---------|-------------|---------|
+| `host` | Piper server hostname or IP | `localhost` |
+| `port` | Wyoming Protocol port | `10200` |
+| `voice` | Voice name (empty = server default) | `""` |
+| `timeout` | Connection timeout in seconds | `10` |
 
 ## Usage
 
@@ -79,6 +102,9 @@ Or use the `text_to_speech` tool — it routes through your Piper server automat
 **No voices found:**
 - Check server logs for voice loading errors
 - Verify Piper voice models are installed on the server
+
+**Desktop app not picking up changes:**
+- Quit and reopen the desktop app (plugins only load at startup)
 
 ## License
 
