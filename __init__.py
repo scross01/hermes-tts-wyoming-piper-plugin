@@ -5,8 +5,8 @@ Connects to a remote Piper TTS service via Wyoming Protocol (TCP)
 and registers as a TTS provider in Hermes.
 
 Usage:
-  1. Install: ln -s ~/Development/hermes-wyoming-piper ~/.hermes/plugins/hermes-wyoming-piper
-  2. Enable: hermes plugins enable hermes-wyoming-piper
+  1. Install: ln -s ~/Development/tts-wyoming-piper ~/.hermes/plugins/tts-wyoming-piper
+  2. Enable: hermes plugins enable tts-wyoming-piper
   3. Configure in config.yaml:
 
     plugins:

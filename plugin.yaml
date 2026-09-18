@@ -1,4 +1,4 @@
-name: hermes-wyoming-piper
+name: tts-wyoming-piper
 version: 0.1.0
 description: "TTS provider using Wyoming Protocol to connect to remote Piper services"
 author: scross01
