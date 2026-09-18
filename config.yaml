@@ -1,4 +1,4 @@
-host: raspberrypi08.home.lan
+host: raspberrypi08
 port: 10200
 voice: ""
 timeout: 10

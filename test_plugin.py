@@ -4,12 +4,17 @@
 import sys
 import os
 
-# Add plugin to path for direct testing
+# Add Hermes venv to path for wyoming package
+hermes_venv = os.path.expanduser("~/.hermes/hermes-agent/venv/lib/python3.11/site-packages")
+if os.path.exists(hermes_venv):
+    sys.path.insert(0, hermes_venv)
+
+# Add plugin to path
 sys.path.insert(0, os.path.expanduser("~/.hermes/plugins/hermes-wyoming-piper"))
 
 from wyoming_client import WyomingPiperClient, WyomingConnectionError
 
-HOST = "raspberrypi08.home.lan"
+HOST = "raspberrypi08"
 PORT = 10200
 
 def test_connection():
