@@ -32,6 +32,20 @@ from agent.tts_provider import TTSProvider
 
 logger = logging.getLogger("hermes-wyoming-piper")
 
+# Debug file logging
+_DEBUG_LOG = os.path.expanduser("~/.hermes/logs/wyoming-piper-debug.log")
+
+def _debug(msg: str) -> None:
+    """Write to debug log file and logger."""
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{timestamp}] {msg}"
+    try:
+        with open(_DEBUG_LOG, "a") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+    logger.warning(msg)
+
 
 class WyomingPiperProvider(TTSProvider):
     """TTS provider that connects to a remote Piper via Wyoming Protocol."""
@@ -102,10 +116,10 @@ class WyomingPiperProvider(TTSProvider):
         **extra: Any,
     ) -> str:
         request_id = int(time.time() * 1000) % 100000
-        logger.warning(
-            "[DEBUG-%d] synthesize() called: text=%d chars, voice=%s, format=%s, output_path=%s",
-            request_id, len(text), voice or self._voice or "(server default)",
-            format, output_path,
+        _debug(
+            f"[{request_id}] synthesize() called: text={len(text)} chars, "
+            f"voice={voice or self._voice or '(server default)'}, format={format}, "
+            f"output_path={output_path}"
         )
 
         client = self._get_client()
@@ -115,9 +129,9 @@ class WyomingPiperProvider(TTSProvider):
         wav_bytes = client.synthesize(text, voice=voice_name)
         elapsed = time.monotonic() - t0
 
-        logger.warning(
-            "[DEBUG-%d] synthesize() received %d bytes from server in %.2fs, voice=%s",
-            request_id, len(wav_bytes), elapsed, voice_name,
+        _debug(
+            f"[{request_id}] received {len(wav_bytes)} bytes from server in {elapsed:.2f}s, "
+            f"voice={voice_name}"
         )
 
         wav_path = output_path
@@ -127,19 +141,15 @@ class WyomingPiperProvider(TTSProvider):
         with open(wav_path, "wb") as f:
             f.write(wav_bytes)
 
-        logger.warning(
-            "[DEBUG-%d] wrote WAV to %s (%d bytes)", request_id, wav_path, len(wav_bytes),
-        )
+        _debug(f"[{request_id}] wrote WAV to {wav_path} ({len(wav_bytes)} bytes)")
 
         if format.lower() not in ("wav", "pcm"):
             converted = self._convert_audio(wav_path, output_path, format)
             if converted:
-                logger.warning(
-                    "[DEBUG-%d] converted to %s: %s", request_id, format, converted,
-                )
+                _debug(f"[{request_id}] converted to {format}: {converted}")
                 return converted
 
-        logger.warning("[DEBUG-%d] returning WAV: %s", request_id, wav_path)
+        _debug(f"[{request_id}] returning WAV: {wav_path}")
         return wav_path
 
     def _convert_audio(self, input_path: str, output_path: str, target_format: str) -> Optional[str]:
@@ -191,7 +201,4 @@ def register(ctx) -> None:
         timeout=ctx.get_config("timeout", 10),
     )
     ctx.register_tts_provider(provider)
-    logger.warning(
-        "[DEBUG] Plugin registered: host=%s port=%s voice=%s",
-        provider._host, provider._port, provider._voice,
-    )
+    _debug(f"Plugin registered: host={provider._host} port={provider._port} voice={provider._voice}")
