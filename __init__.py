@@ -24,6 +24,8 @@ Usage:
 from __future__ import annotations
 
 import logging
+import os
+import time
 from typing import Any, Dict, List, Optional
 
 from agent.tts_provider import TTSProvider
@@ -99,10 +101,24 @@ class WyomingPiperProvider(TTSProvider):
         format: str = "mp3",
         **extra: Any,
     ) -> str:
+        request_id = int(time.time() * 1000) % 100000
+        logger.warning(
+            "[DEBUG-%d] synthesize() called: text=%d chars, voice=%s, format=%s, output_path=%s",
+            request_id, len(text), voice or self._voice or "(server default)",
+            format, output_path,
+        )
+
         client = self._get_client()
         voice_name = voice or self.default_voice()
 
+        t0 = time.monotonic()
         wav_bytes = client.synthesize(text, voice=voice_name)
+        elapsed = time.monotonic() - t0
+
+        logger.warning(
+            "[DEBUG-%d] synthesize() received %d bytes from server in %.2fs, voice=%s",
+            request_id, len(wav_bytes), elapsed, voice_name,
+        )
 
         wav_path = output_path
         if not wav_path.endswith(".wav"):
@@ -111,16 +127,23 @@ class WyomingPiperProvider(TTSProvider):
         with open(wav_path, "wb") as f:
             f.write(wav_bytes)
 
+        logger.warning(
+            "[DEBUG-%d] wrote WAV to %s (%d bytes)", request_id, wav_path, len(wav_bytes),
+        )
+
         if format.lower() not in ("wav", "pcm"):
             converted = self._convert_audio(wav_path, output_path, format)
             if converted:
+                logger.warning(
+                    "[DEBUG-%d] converted to %s: %s", request_id, format, converted,
+                )
                 return converted
 
+        logger.warning("[DEBUG-%d] returning WAV: %s", request_id, wav_path)
         return wav_path
 
     def _convert_audio(self, input_path: str, output_path: str, target_format: str) -> Optional[str]:
         import subprocess
-        import os
 
         if not output_path.endswith(f".{target_format}"):
             output_path = output_path.rsplit(".", 1)[0] + f".{target_format}"
@@ -168,3 +191,7 @@ def register(ctx) -> None:
         timeout=ctx.get_config("timeout", 10),
     )
     ctx.register_tts_provider(provider)
+    logger.warning(
+        "[DEBUG] Plugin registered: host=%s port=%s voice=%s",
+        provider._host, provider._port, provider._voice,
+    )
