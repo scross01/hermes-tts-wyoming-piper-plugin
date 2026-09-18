@@ -8,7 +8,7 @@ A [Hermes Agent](https://github.com/NousResearch/hermes-agent) TTS plugin that c
 
 [Piper](https://github.com/OHF-Voice/wyoming-piper) is a fast, local neural text-to-speech engine that speaks Wyoming Protocol. It runs entirely on CPU, supports 44 languages with pre-trained voices, and needs no API key.
 
-Most people use Wyoming Piper through Home Assistant's voice pipeline. This plugin bridges a different path: **Hermes Agent → Wyoming Protocol → Piper on a remote server**. This is useful when you want your AI agent to speak through a Piper instance running on another machine (a Raspberry Pi, a home server, etc.) without Home Assistant in the loop.
+Most people use Wyoming Piper through Home Assistant's voice pipeline. This plugin bridges a different path: **Hermes Agent → Wyoming Protocol → Piper TTS server**. This is useful when you want your AI agent to generate speech through a Piper instance running on another machine (a Raspberry Pi, a home server, etc.) without Home Assistant in the loop.
 
 ### Who is this for?
 
