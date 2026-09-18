@@ -1,5 +1,5 @@
 name: tts-wyoming-piper
-version: 0.2.0
+version: 0.2.1
 description: "TTS provider using Wyoming Protocol to connect to remote Piper services"
 author: scross01
 license: MIT
@@ -25,5 +25,9 @@ config:
     type: string
     default: "pipe"
     description: "Synthesis mode: pipe (direct PCM→Opus, 1 conversion) or stream (streaming delivery)"
+  debug:
+    type: boolean
+    default: false
+    description: "Enable verbose debug logging to ~/.hermes/logs/wyoming-piper-debug.log"
 
 tools: []

@@ -28,11 +28,14 @@ from agent.tts_provider import TTSProvider
 
 logger = logging.getLogger("hermes-wyoming-piper")
 
-# Debug file logging
+# Debug file logging — gated by plugins.entries.tts-wyoming-piper.settings.debug
 _DEBUG_LOG = os.path.expanduser("~/.hermes/logs/wyoming-piper-debug.log")
+_debug_enabled = False
 
 def _debug(msg: str) -> None:
-    """Write to debug log file and logger."""
+    """Write to debug log file and logger when debug mode is on."""
+    if not _debug_enabled:
+        return
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{timestamp}] {msg}"
     try:
@@ -408,6 +411,8 @@ class WyomingPiperProvider(TTSProvider):
 
 
 def register(ctx) -> None:
+    global _debug_enabled
+    _debug_enabled = bool(ctx.get_config("debug", False))
     provider = WyomingPiperProvider(
         host=ctx.get_config("host", "localhost"),
         port=ctx.get_config("port", 10200),
@@ -417,4 +422,4 @@ def register(ctx) -> None:
     )
     ctx.register_tts_provider(provider)
     _debug(f"Plugin registered: host={provider._host} port={provider._port} "
-           f"voice={provider._voice} mode={provider._mode}")
+           f"voice={provider._voice} mode={provider._mode} debug={_debug_enabled}")

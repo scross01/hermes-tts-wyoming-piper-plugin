@@ -51,6 +51,7 @@ plugins:
         voice: en_US-lessac-medium
         timeout: 10
         mode: pipe
+        debug: false
 ```
 
 | Setting | Description | Default |
@@ -60,6 +61,7 @@ plugins:
 | `voice` | Voice name (empty = server default) | `""` |
 | `timeout` | Connection timeout in seconds | `10` |
 | `mode` | Synthesis mode: `pipe` or `stream` | `pipe` |
+| `debug` | Enable verbose debug logging to `~/.hermes/logs/wyoming-piper-debug.log` | `false` |
 
 ### Synthesis Modes
 
@@ -102,6 +104,17 @@ Or use the `text_to_speech` tool — it routes through your Piper server automat
 7. In `stream` mode: yields Opus chunks as they arrive
 
 ## Troubleshooting
+
+**Enable debug logging:**
+Set `debug: true` in your plugin settings to write detailed logs:
+```yaml
+plugins:
+  entries:
+    tts-wyoming-piper:
+      settings:
+        debug: true
+```
+Logs are written to `~/.hermes/logs/wyoming-piper-debug.log`. Disable by removing the setting or setting it to `false`.
 
 **Connection refused:**
 - Verify Piper server is running: `nc -z piper.local 10200`

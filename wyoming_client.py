@@ -239,68 +239,77 @@ class WyomingPiperClient:
 
         Yields raw PCM chunks as they arrive from the server, plus the audio format
         on the first yield. The caller can pipe these directly to ffmpeg.
+
+        Each call creates its own event loop + client connection in a worker thread
+        to avoid "Future attached to a different loop" errors from the wyoming library.
         """
-        self.connect()
-
-        async def _synthesize_stream():
-            assert self._client is not None
-
-            synthesize_voice = None
-            if voice:
-                synthesize_voice = SynthesizeVoice(name=voice)
-
-            synthesize = Synthesize(text=text, voice=synthesize_voice)
-            await self._client.write_event(synthesize.event())
-
-            sample_rate = 22050
-            sample_width = 2
-            channels = 1
-            format_sent = False
-
-            while True:
-                event = await self._client.read_event()
-                if event is None:
-                    raise WyomingServerError("Connection closed during synthesis")
-
-                if event.type == "audio-start":
-                    sample_rate = event.data.get("rate", 22050)
-                    sample_width = event.data.get("width", 2)
-                    channels = event.data.get("channels", 1)
-                    self._audio_format = (sample_rate, sample_width, channels)
-
-                elif event.type == "audio-chunk":
-                    chunk = AudioChunk.from_event(event)
-                    if not format_sent:
-                        yield chunk.audio, (sample_rate, sample_width, channels)
-                        format_sent = True
-                    else:
-                        yield chunk.audio, None
-
-                elif event.type == "audio-stop":
-                    break
-
-                elif event.type == "synthesize-stopped":
-                    break
-
-                elif event.type == "error":
-                    error_msg = event.data.get("text", "Unknown error")
-                    raise WyomingServerError(f"Synthesis error: {error_msg}")
-
         from queue import Queue
         from threading import Thread
 
         q: "Queue[Optional[Tuple[bytes, Tuple[int, int, int]]]]" = Queue()
 
-        async def _consume():
+        _host, _port, _timeout = self.host, self.port, self.timeout
+
+        def _consume_on_new_loop():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
             try:
-                async for item in _synthesize_stream():
-                    q.put(item)
+                async def _run():
+                    client = AsyncTcpClient(
+                        _host, _port,
+                        connect_timeout=_timeout,
+                        read_timeout=_timeout,
+                    )
+                    await client.connect()
+                    try:
+                        synthesize_voice = None
+                        if voice:
+                            synthesize_voice = SynthesizeVoice(name=voice)
+
+                        syn = Synthesize(text=text, voice=synthesize_voice)
+                        await client.write_event(syn.event())
+
+                        sample_rate = 22050
+                        sample_width = 2
+                        channels = 1
+                        format_sent = False
+
+                        while True:
+                            event = await client.read_event()
+                            if event is None:
+                                raise WyomingServerError("Connection closed during synthesis")
+
+                            if event.type == "audio-start":
+                                sample_rate = event.data.get("rate", 22050)
+                                sample_width = event.data.get("width", 2)
+                                channels = event.data.get("channels", 1)
+
+                            elif event.type == "audio-chunk":
+                                chunk = AudioChunk.from_event(event)
+                                if not format_sent:
+                                    q.put((chunk.audio, (sample_rate, sample_width, channels)))
+                                    format_sent = True
+                                else:
+                                    q.put((chunk.audio, None))
+
+                            elif event.type == "audio-stop":
+                                break
+                            elif event.type == "synthesize-stopped":
+                                break
+                            elif event.type == "error":
+                                error_msg = event.data.get("text", "Unknown error")
+                                raise WyomingServerError(f"Synthesis error: {error_msg}")
+                    finally:
+                        await client.disconnect()
+
+                loop.run_until_complete(_run())
             except Exception as e:
                 q.put(e)
             finally:
                 q.put(None)
+                loop.close()
 
-        thread = Thread(target=self._run_consume, args=(q, _consume), daemon=True)
+        thread = Thread(target=_consume_on_new_loop, daemon=True)
         thread.start()
 
         while True:
@@ -312,15 +321,6 @@ class WyomingPiperClient:
                     raise item
                 raise WyomingServerError(f"Synthesis failed: {item}") from item
             yield item
-
-    @staticmethod
-    def _run_consume(q, coro_func):
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(coro_func())
-        finally:
-            loop.close()
 
     def is_connected(self) -> bool:
         """Check if the client is currently connected."""
