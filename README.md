@@ -20,9 +20,9 @@ Most people use Wyoming Piper through Home Assistant's voice pipeline. This plug
 ## Features
 
 - Connect to any Wyoming-compatible Piper server
-- Query available voices automatically (174+ voices across 44 languages)
+- 44 languages, 174+ pre-trained voices
 - Voice selection via config or per-request
-- Voice bubble support (Telegram, Discord)
+- Voice bubble support (Telegram, Discord) — gateway handles Opus conversion
 - Warm-up and connection reuse for fast repeated synthesis
 
 ## Installation
@@ -53,7 +53,7 @@ plugins:
   entries:
     tts-wyoming-piper:
       settings:
-        host: raspberrypi08
+        host: piper.local
         port: 10200
         voice: en_US-lessac-medium
         timeout: 10
@@ -80,22 +80,22 @@ Or use the `text_to_speech` tool — it routes through your Piper server automat
 
 - Python 3.9+
 - Network access to the Piper server
-- ffmpeg (for MP3/Opus output)
+- ffmpeg (for MP3 output)
 
 ## How It Works
 
 1. Plugin registers as a TTS provider named `wyoming-piper`
 2. On synthesis request, connects to the Wyoming Piper server via TCP
-3. Sends `describe` event to discover available voices
+3. Sends `describe` event to discover available voices (used for default voice selection)
 4. Sends `synthesize` event with the text
 5. Receives `audio-start` → `audio-chunk` × N → `audio-stop` events
 6. Writes WAV audio to output file
-7. Converts to MP3/Opus with ffmpeg
+7. Converts to MP3 with ffmpeg (gateway handles Opus for voice bubbles)
 
 ## Troubleshooting
 
 **Connection refused:**
-- Verify Piper server is running: `nc -z raspberrypi08 10200`
+- Verify Piper server is running: `nc -z piper.local 10200`
 - Check firewall rules
 - Ensure Wyoming Protocol server is configured (not HTTP)
 

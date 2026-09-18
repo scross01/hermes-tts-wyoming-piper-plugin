@@ -13,7 +13,7 @@ Usage:
       entries:
         hermes-wyoming-piper:
           settings:
-            host: raspberrypi08
+            host: piper.local
             port: 10200
             voice: en_US-lessac-medium
             timeout: 10
