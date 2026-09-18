@@ -27,19 +27,11 @@ Most people use Wyoming Piper through Home Assistant's voice pipeline. This plug
 
 ## Installation
 
-### Option 1: Symlink (development)
-
 ```bash
-ln -s ~/Development/tts-wyoming-piper ~/.hermes/plugins/tts-wyoming-piper
-hermes plugins enable tts-wyoming-piper
+hermes plugins install scross01/hermes-tts-wyoming-piper-plugin --enable
 ```
 
-### Option 2: Copy
-
-```bash
-cp -r ~/Development/tts-wyoming-piper ~/.hermes/plugins/tts-wyoming-piper
-hermes plugins enable tts-wyoming-piper
-```
+This clones the repo and enables the plugin. Restart the desktop app or gateway to activate.
 
 ## Configuration
 
