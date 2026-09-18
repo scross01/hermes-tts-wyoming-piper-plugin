@@ -4,29 +4,24 @@ Hermes Wyoming Piper TTS Plugin
 Connects to a remote Piper TTS service via Wyoming Protocol (TCP)
 and registers as a TTS provider in Hermes.
 
-Usage:
-  1. Install: ln -s ~/Development/tts-wyoming-piper ~/.hermes/plugins/tts-wyoming-piper
-  2. Enable: hermes plugins enable tts-wyoming-piper
-  3. Configure in config.yaml:
-
-    plugins:
-      entries:
-        hermes-wyoming-piper:
-          settings:
-            host: piper.local
-            port: 10200
-            voice: en_US-lessac-medium
-            timeout: 10
-
-  4. Set tts.provider: wyoming-piper
+Config settings (plugins.entries.tts-wyoming-piper.settings):
+  host: piper.local          # Piper server hostname
+  port: 10200                 # Wyoming Protocol port
+  voice: en_US-lessac-medium  # Voice name
+  timeout: 10                 # Connection timeout seconds
+  mode: pipe                  # pipe (default) or stream
+    - pipe: PCM → ffmpeg → Opus directly (1 conversion)
+    - stream: streaming delivery via TTSProvider.stream()
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import shutil
+import subprocess
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 from agent.tts_provider import TTSProvider
 
@@ -53,11 +48,12 @@ class WyomingPiperProvider(TTSProvider):
     _name = "wyoming-piper"
 
     def __init__(self, host: str = "localhost", port: int = 10200,
-                 voice: str = "", timeout: int = 10):
+                 voice: str = "", timeout: int = 10, mode: str = "pipe"):
         self._host = host
         self._port = port
         self._voice = voice
         self._timeout = timeout
+        self._mode = mode  # "pipe" or "stream"
         self._client = None
         self._voices: Optional[List[Dict[str, Any]]] = None
 
@@ -104,6 +100,8 @@ class WyomingPiperProvider(TTSProvider):
         voices = self.list_voices()
         return voices[0]["id"] if voices else None
 
+    # --- Option 1: Pipe PCM → Opus (default) ---
+
     def synthesize(
         self,
         text: str,
@@ -117,61 +115,237 @@ class WyomingPiperProvider(TTSProvider):
     ) -> str:
         request_id = int(time.time() * 1000) % 100000
         _debug(
-            f"[{request_id}] synthesize() called: text={len(text)} chars, "
-            f"voice={voice or self._voice or '(server default)'}, format={format}, "
-            f"output_path={output_path}"
+            f"[{request_id}] synthesize() mode={self._mode}: text={len(text)} chars, "
+            f"voice={voice or self._voice or '(server default)'}, format={format}"
         )
 
+        if self._mode == "stream":
+            return self._synthesize_stream_to_file(request_id, text, output_path,
+                                                   voice=voice, format=format)
+
+        return self._synthesize_pipe(request_id, text, output_path,
+                                     voice=voice, format=format)
+
+    def _synthesize_pipe(self, request_id: int, text: str, output_path: str,
+                         voice: Optional[str] = None, format: str = "mp3") -> str:
+        """Option 1: Pipe PCM directly to ffmpeg, skip WAV/MP3 intermediaries."""
         client = self._get_client()
         voice_name = voice or self.default_voice()
+
+        # Determine target format - use opus for voice_bubble platforms, mp3 otherwise
+        target_ext = self._target_extension(format)
 
         t0 = time.monotonic()
         wav_bytes = client.synthesize(text, voice=voice_name)
         elapsed = time.monotonic() - t0
 
         _debug(
-            f"[{request_id}] received {len(wav_bytes)} bytes from server in {elapsed:.2f}s, "
+            f"[{request_id}] received {len(wav_bytes)} bytes in {elapsed:.2f}s, "
             f"voice={voice_name}"
         )
 
-        wav_path = output_path
-        if not wav_path.endswith(".wav"):
+        # Get audio format from client
+        fmt = client.audio_format or (22050, 2, 1)
+        rate, width, channels = fmt
+
+        # If target is wav or pcm, write directly
+        if target_ext in ("wav", "pcm"):
+            wav_path = output_path if output_path.endswith(".wav") else output_path.rsplit(".", 1)[0] + ".wav"
+            with open(wav_path, "wb") as f:
+                f.write(wav_bytes)
+            _debug(f"[{request_id}] wrote WAV: {wav_path}")
+            return wav_path
+
+        # Pipe PCM → ffmpeg → target format
+        return self._pipe_pcm_to_format(request_id, wav_bytes, rate, width, channels,
+                                         output_path, target_ext)
+
+    def _pipe_pcm_to_format(self, request_id: int, pcm_data: bytes,
+                            rate: int, width: int, channels: int,
+                            output_path: str, target_ext: str) -> str:
+        """Pipe raw PCM data through ffmpeg to target format."""
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            # Fallback: write as WAV
             wav_path = output_path.rsplit(".", 1)[0] + ".wav"
+            with open(wav_path, "wb") as f:
+                f.write(pcm_data)
+            _debug(f"[{request_id}] ffmpeg not found, wrote raw PCM as WAV")
+            return wav_path
 
-        with open(wav_path, "wb") as f:
-            f.write(wav_bytes)
+        out_path = output_path if output_path.endswith(f".{target_ext}") else \
+                   output_path.rsplit(".", 1)[0] + f".{target_ext}"
 
-        _debug(f"[{request_id}] wrote WAV to {wav_path} ({len(wav_bytes)} bytes)")
+        # Build ffmpeg command for raw PCM input
+        cmd = [
+            ffmpeg, "-y",
+            "-f", "s16le",  # PCM 16-bit little-endian
+            "-ar", str(rate),
+            "-ac", str(channels),
+            "-i", "pipe:0",  # Read from stdin
+        ]
 
-        if format.lower() not in ("wav", "pcm"):
-            converted = self._convert_audio(wav_path, output_path, format)
-            if converted:
-                _debug(f"[{request_id}] converted to {format}: {converted}")
-                return converted
+        if target_ext == "ogg":
+            # Opus for voice bubbles
+            cmd.extend(["-acodec", "libopus", "-b:a", "48k", "-vbr", "on"])
+        elif target_ext == "mp3":
+            cmd.extend(["-acodec", "libmp3lame"])
+        elif target_ext == "flac":
+            cmd.extend(["-acodec", "flac"])
 
-        _debug(f"[{request_id}] returning WAV: {wav_path}")
-        return wav_path
-
-    def _convert_audio(self, input_path: str, output_path: str, target_format: str) -> Optional[str]:
-        import subprocess
-
-        if not output_path.endswith(f".{target_format}"):
-            output_path = output_path.rsplit(".", 1)[0] + f".{target_format}"
+        cmd.append(out_path)
 
         try:
             result = subprocess.run(
-                ["ffmpeg", "-y", "-i", input_path, "-acodec", "libmp3lame", output_path],
+                cmd,
+                input=pcm_data,
                 capture_output=True,
                 timeout=30,
             )
             if result.returncode == 0:
-                if input_path != output_path:
-                    os.remove(input_path)
-                return output_path
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            pass
+                _debug(f"[{request_id}] piped PCM → {target_ext}: {out_path}")
+                return out_path
+            else:
+                _debug(f"[{request_id}] ffmpeg error: {result.stderr[:200]}")
+        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+            _debug(f"[{request_id}] ffmpeg failed: {e}")
 
-        return None
+        # Fallback to WAV
+        wav_path = output_path.rsplit(".", 1)[0] + ".wav"
+        with open(wav_path, "wb") as f:
+            f.write(pcm_data)
+        return wav_path
+
+    def _target_extension(self, format: str) -> str:
+        """Determine target file extension from format hint."""
+        fmt = format.lower()
+        if fmt in ("opus", "ogg"):
+            return "ogg"
+        elif fmt in ("wav", "pcm"):
+            return "wav"
+        elif fmt == "flac":
+            return "flac"
+        return "mp3"
+
+    # --- Option 2: Streaming delivery ---
+
+    def _synthesize_stream_to_file(self, request_id: int, text: str, output_path: str,
+                                   voice: Optional[str] = None, format: str = "mp3") -> str:
+        """Option 2: Stream PCM chunks through ffmpeg as they arrive."""
+        client = self._get_client()
+        voice_name = voice or self.default_voice()
+        target_ext = self._target_extension(format)
+
+        t0 = time.monotonic()
+        chunks_received = 0
+        total_bytes = 0
+
+        # Get audio format from first chunk
+        pcm_chunks = []
+        audio_fmt = None
+
+        for pcm_bytes, fmt_info in client.synthesize_stream(text, voice=voice_name):
+            if fmt_info is not None:
+                audio_fmt = fmt_info
+            pcm_chunks.append(pcm_bytes)
+            chunks_received += 1
+            total_bytes += len(pcm_bytes)
+
+        elapsed = time.monotonic() - t0
+        _debug(
+            f"[{request_id}] streamed {chunks_received} chunks, {total_bytes} bytes "
+            f"in {elapsed:.2f}s, voice={voice_name}"
+        )
+
+        if audio_fmt is None:
+            audio_fmt = (22050, 2, 1)
+        rate, width, channels = audio_fmt
+
+        raw_pcm = b"".join(pcm_chunks)
+
+        if target_ext in ("wav", "pcm"):
+            wav_path = output_path if output_path.endswith(".wav") else output_path.rsplit(".", 1)[0] + ".wav"
+            with open(wav_path, "wb") as f:
+                f.write(raw_pcm)
+            return wav_path
+
+        return self._pipe_pcm_to_format(request_id, raw_pcm, rate, width, channels,
+                                         output_path, target_ext)
+
+    def stream(
+        self,
+        text: str,
+        *,
+        voice: Optional[str] = None,
+        model: Optional[str] = None,
+        format: str = "opus",
+        **extra: Any,
+    ) -> Iterator[bytes]:
+        """Stream synthesized audio bytes for voice bubble delivery.
+
+        Yields Opus-encoded audio chunks as they arrive from Piper.
+        """
+        client = self._get_client()
+        voice_name = voice or self.default_voice()
+
+        _debug(f"stream() called: text={len(text)} chars, voice={voice_name}")
+
+        # Stream PCM chunks through ffmpeg for Opus encoding
+        proc: Optional[subprocess.Popen] = None
+        try:
+            ffmpeg = shutil.which("ffmpeg")
+            if not ffmpeg:
+                raise RuntimeError("ffmpeg not found for streaming Opus conversion")
+
+            cmd = [
+                ffmpeg, "-y",
+                "-f", "s16le",
+                "-ar", "22050",  # Will be updated from first chunk
+                "-ac", "1",
+                "-i", "pipe:0",
+                "-acodec", "libopus",
+                "-b:a", "48k",
+                "-vbr", "on",
+                "-application", "voip",
+                "pipe:1",  # Output to stdout
+            ]
+
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+
+            for pcm_bytes, fmt_info in client.synthesize_stream(text, voice=voice_name):
+                if fmt_info is not None:
+                    rate, width, channels = fmt_info
+                    _debug(f"stream: format={fmt_info}")
+
+                assert proc.stdin is not None
+                assert proc.stdout is not None
+                proc.stdin.write(pcm_bytes)
+                proc.stdin.flush()
+
+                opus_chunk = proc.stdout.read(4096)
+                if opus_chunk:
+                    yield opus_chunk
+
+            # Flush and get remaining output
+            assert proc.stdin is not None
+            assert proc.stdout is not None
+            proc.stdin.close()
+            remaining = proc.stdout.read()
+            if remaining:
+                yield remaining
+
+        finally:
+            if proc:
+                if proc.stdin:
+                    proc.stdin.close()
+                proc.wait()
+
+        _debug("stream() completed")
 
     def warm(self) -> None:
         try:
@@ -199,6 +373,8 @@ def register(ctx) -> None:
         port=ctx.get_config("port", 10200),
         voice=ctx.get_config("voice", ""),
         timeout=ctx.get_config("timeout", 10),
+        mode=ctx.get_config("mode", "pipe"),
     )
     ctx.register_tts_provider(provider)
-    _debug(f"Plugin registered: host={provider._host} port={provider._port} voice={provider._voice}")
+    _debug(f"Plugin registered: host={provider._host} port={provider._port} "
+           f"voice={provider._voice} mode={provider._mode}")

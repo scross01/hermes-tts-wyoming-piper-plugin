@@ -10,7 +10,7 @@ import asyncio
 import io
 import logging
 import wave
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from wyoming.audio import AudioChunk, AudioStart, AudioStop
 from wyoming.client import AsyncTcpClient
@@ -49,13 +49,6 @@ class WyomingVoice:
 class WyomingPiperClient:
     """
     Client for connecting to a Wyoming Protocol Piper TTS server.
-
-    Usage:
-        client = WyomingPiperClient("raspberrypi08.home.lan", 10200)
-        client.connect()
-        voices = client.describe()
-        audio = client.synthesize("Hello world", voice=voices[0].name)
-        client.disconnect()
     """
 
     def __init__(
@@ -71,6 +64,7 @@ class WyomingPiperClient:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._voices: Optional[List[WyomingVoice]] = None
         self._info: Optional[Dict[str, Any]] = None
+        self._audio_format: Optional[Tuple[int, int, int]] = None  # (rate, width, channels)
 
     def _get_loop(self) -> asyncio.AbstractEventLoop:
         """Get or create event loop."""
@@ -154,6 +148,7 @@ class WyomingPiperClient:
             self._client = None
             self._voices = None
             self._info = None
+            self._audio_format = None
             logger.info("Disconnected from Wyoming server")
 
     def describe(self) -> List[WyomingVoice]:
@@ -162,21 +157,23 @@ class WyomingPiperClient:
             self.connect()
         return self._voices or []
 
+    @property
+    def audio_format(self) -> Optional[Tuple[int, int, int]]:
+        """Last known audio format (rate, width, channels) from synthesis."""
+        return self._audio_format
+
     def synthesize(
         self,
         text: str,
         voice: Optional[str] = None,
     ) -> bytes:
-        """
-        Synthesize text to WAV audio bytes.
-        """
+        """Synthesize text to WAV audio bytes."""
         self.connect()
         loop = self._get_loop()
 
         async def _synthesize():
             assert self._client is not None
 
-            # Build synthesize event
             synthesize_voice = None
             if voice:
                 synthesize_voice = SynthesizeVoice(name=voice)
@@ -184,7 +181,6 @@ class WyomingPiperClient:
             synthesize = Synthesize(text=text, voice=synthesize_voice)
             await self._client.write_event(synthesize.event())
 
-            # Collect audio chunks
             audio_chunks: List[bytes] = []
             sample_rate = 22050
             sample_width = 2
@@ -199,17 +195,12 @@ class WyomingPiperClient:
                     sample_rate = event.data.get("rate", 22050)
                     sample_width = event.data.get("width", 2)
                     channels = event.data.get("channels", 1)
-                    logger.debug(
-                        "Audio start: rate=%d width=%d channels=%d",
-                        sample_rate, sample_width, channels,
-                    )
 
                 elif event.type == "audio-chunk":
                     chunk = AudioChunk.from_event(event)
                     audio_chunks.append(chunk.audio)
 
                 elif event.type == "audio-stop":
-                    logger.debug("Audio stop after %d chunks", len(audio_chunks))
                     break
 
                 elif event.type == "synthesize-stopped":
@@ -219,13 +210,10 @@ class WyomingPiperClient:
                     error_msg = event.data.get("text", "Unknown error")
                     raise WyomingServerError(f"Synthesis error: {error_msg}")
 
-                else:
-                    logger.warning("Unexpected event: %s", event.type)
+            self._audio_format = (sample_rate, sample_width, channels)
 
-            # Combine chunks
             raw_audio = b"".join(audio_chunks)
 
-            # Wrap in WAV container
             wav_buffer = io.BytesIO()
             with wave.open(wav_buffer, "wb") as wf:
                 wf.setnchannels(channels)
@@ -241,6 +229,79 @@ class WyomingPiperClient:
             if isinstance(e, WyomingServerError):
                 raise
             raise WyomingServerError(f"Synthesis failed: {e}") from e
+
+    def synthesize_stream(
+        self,
+        text: str,
+        voice: Optional[str] = None,
+    ) -> Iterator[Tuple[bytes, Tuple[int, int, int]]]:
+        """Synthesize text and yield (pcm_bytes, (rate, width, chunks)) tuples.
+
+        Yields raw PCM chunks as they arrive from the server, plus the audio format
+        on the first yield. The caller can pipe these directly to ffmpeg.
+        """
+        self.connect()
+        loop = self._get_loop()
+
+        async def _synthesize_stream():
+            assert self._client is not None
+
+            synthesize_voice = None
+            if voice:
+                synthesize_voice = SynthesizeVoice(name=voice)
+
+            synthesize = Synthesize(text=text, voice=synthesize_voice)
+            await self._client.write_event(synthesize.event())
+
+            sample_rate = 22050
+            sample_width = 2
+            channels = 1
+            format_sent = False
+
+            while True:
+                event = await self._client.read_event()
+                if event is None:
+                    raise WyomingServerError("Connection closed during synthesis")
+
+                if event.type == "audio-start":
+                    sample_rate = event.data.get("rate", 22050)
+                    sample_width = event.data.get("width", 2)
+                    channels = event.data.get("channels", 1)
+                    self._audio_format = (sample_rate, sample_width, channels)
+
+                elif event.type == "audio-chunk":
+                    chunk = AudioChunk.from_event(event)
+                    if not format_sent:
+                        yield chunk.audio, (sample_rate, sample_width, channels)
+                        format_sent = True
+                    else:
+                        yield chunk.audio, None
+
+                elif event.type == "audio-stop":
+                    break
+
+                elif event.type == "synthesize-stopped":
+                    break
+
+                elif event.type == "error":
+                    error_msg = event.data.get("text", "Unknown error")
+                    raise WyomingServerError(f"Synthesis error: {error_msg}")
+
+        try:
+            yield from loop.run_until_complete(
+                self._collect_async_stream(_synthesize_stream())
+            )
+        except Exception as e:
+            if isinstance(e, WyomingServerError):
+                raise
+            raise WyomingServerError(f"Synthesis failed: {e}") from e
+
+    async def _collect_async_stream(self, async_gen):
+        """Collect async generator into a list of tuples for sync iteration."""
+        results = []
+        async for item in async_gen:
+            results.append(item)
+        return results
 
     def is_connected(self) -> bool:
         """Check if the client is currently connected."""

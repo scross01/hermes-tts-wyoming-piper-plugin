@@ -24,6 +24,7 @@ Most people use Wyoming Piper through Home Assistant's voice pipeline. This plug
 - Voice selection via config or per-request
 - Voice bubble support (Telegram, Discord) — gateway handles Opus conversion
 - Warm-up and connection reuse for fast repeated synthesis
+- Two synthesis modes: `pipe` (efficient) and `stream` (streaming delivery)
 
 ## Installation
 
@@ -49,6 +50,7 @@ plugins:
         port: 10200
         voice: en_US-lessac-medium
         timeout: 10
+        mode: pipe
 ```
 
 | Setting | Description | Default |
@@ -57,6 +59,21 @@ plugins:
 | `port` | Wyoming Protocol port | `10200` |
 | `voice` | Voice name (empty = server default) | `""` |
 | `timeout` | Connection timeout in seconds | `10` |
+| `mode` | Synthesis mode: `pipe` or `stream` | `pipe` |
+
+### Synthesis Modes
+
+**`pipe` (default)** — Efficient single-pass conversion:
+```
+Piper TCP → PCM → ffmpeg → Opus/MP3
+```
+Writes PCM directly to ffmpeg stdin, outputs the target format in one pass. No intermediate WAV or MP3 files.
+
+**`stream`** — Streaming delivery via `TTSProvider.stream()`:
+```
+Piper TCP chunks → ffmpeg (streaming) → Opus chunks → gateway
+```
+Implements the `stream()` method for providers that support it. Audio chunks are yielded as they arrive, allowing the gateway to begin delivery before synthesis completes. Lower latency for long responses.
 
 ## Usage
 
@@ -72,7 +89,7 @@ Or use the `text_to_speech` tool — it routes through your Piper server automat
 
 - Python 3.9+
 - Network access to the Piper server
-- ffmpeg (for MP3 output)
+- ffmpeg (for Opus/MP3 output)
 
 ## How It Works
 
@@ -81,8 +98,8 @@ Or use the `text_to_speech` tool — it routes through your Piper server automat
 3. Sends `describe` event to discover available voices (used for default voice selection)
 4. Sends `synthesize` event with the text
 5. Receives `audio-start` → `audio-chunk` × N → `audio-stop` events
-6. Writes WAV audio to output file
-7. Converts to MP3 with ffmpeg (gateway handles Opus for voice bubbles)
+6. In `pipe` mode: pipes PCM directly to ffmpeg for target format
+7. In `stream` mode: yields Opus chunks as they arrive
 
 ## Troubleshooting
 

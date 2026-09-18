@@ -1,5 +1,5 @@
 name: tts-wyoming-piper
-version: 0.1.0
+version: 0.2.0
 description: "TTS provider using Wyoming Protocol to connect to remote Piper services"
 author: scross01
 license: MIT
@@ -21,5 +21,9 @@ config:
     type: integer
     default: 10
     description: "Connection timeout in seconds"
+  mode:
+    type: string
+    default: "pipe"
+    description: "Synthesis mode: pipe (direct PCM→Opus, 1 conversion) or stream (streaming delivery)"
 
 tools: []
