@@ -5,19 +5,28 @@ Connects to a remote Piper TTS service via Wyoming Protocol (TCP)
 and registers as a TTS provider in Hermes.
 
 Usage:
-  1. Install plugin: symlink to ~/.hermes/plugins/hermes-wyoming-piper
+  1. Install: ln -s ~/Development/hermes-wyoming-piper ~/.hermes/plugins/hermes-wyoming-piper
   2. Enable: hermes plugins enable hermes-wyoming-piper
-  3. Configure: set tts.provider to "wyoming-piper" in config.yaml
-  4. Set connection: tts.providers.wyoming-piper.host/port in config.yaml
+  3. Configure in config.yaml:
+
+    plugins:
+      entries:
+        hermes-wyoming-piper:
+          settings:
+            host: raspberrypi08
+            port: 10200
+            voice: en_US-lessac-medium
+            timeout: 10
+
+  4. Set tts.provider: wyoming-piper
 """
 
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any, Dict, List, Optional
 
-from agent.tts_provider import TTSProvider, VALID_OUTPUT_FORMATS
+from agent.tts_provider import TTSProvider
 
 logger = logging.getLogger("hermes-wyoming-piper")
 
@@ -27,8 +36,12 @@ class WyomingPiperProvider(TTSProvider):
 
     _name = "wyoming-piper"
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
-        self._config = config or {}
+    def __init__(self, host: str = "localhost", port: int = 10200,
+                 voice: str = "", timeout: int = 10):
+        self._host = host
+        self._port = port
+        self._voice = voice
+        self._timeout = timeout
         self._client = None
         self._voices: Optional[List[Dict[str, Any]]] = None
 
@@ -36,44 +49,20 @@ class WyomingPiperProvider(TTSProvider):
     def name(self) -> str:
         return self._name
 
-    def _get_config(self) -> Dict[str, Any]:
-        """Get provider config from Hermes config."""
-        try:
-            from hermes_constants import get_hermes_home
-            import yaml
-
-            config_path = os.path.join(get_hermes_home(), "config.yaml")
-            with open(config_path) as f:
-                full_config = yaml.safe_load(f) or {}
-
-            tts_config = full_config.get("tts", {})
-            providers = tts_config.get("providers", {})
-            return providers.get(self._name, {})
-        except Exception as e:
-            logger.debug("Could not load config: %s", e)
-            return {}
-
     def _get_client(self):
-        """Get or create Wyoming client with lazy import."""
         if self._client is not None:
             return self._client
 
         from .wyoming_client import WyomingPiperClient
 
-        config = self._get_config()
-        host = config.get("host", "localhost")
-        port = config.get("port", 10200)
-        timeout = config.get("timeout", 10)
-
         self._client = WyomingPiperClient(
-            host=host,
-            port=port,
-            timeout=timeout,
+            host=self._host,
+            port=self._port,
+            timeout=self._timeout,
         )
         return self._client
 
     def list_voices(self) -> List[Dict[str, Any]]:
-        """Query server for available voices."""
         if self._voices is not None:
             return self._voices
 
@@ -90,16 +79,12 @@ class WyomingPiperProvider(TTSProvider):
             ]
             return self._voices
         except Exception as e:
-            logger.warning("Failed to list voices from Wyoming server: %s", e)
+            logger.warning("Failed to list voices: %s", e)
             return []
 
     def default_voice(self) -> Optional[str]:
-        """Get default voice from config or server."""
-        config = self._get_config()
-        voice = config.get("voice", "")
-        if voice:
-            return voice
-
+        if self._voice:
+            return self._voice
         voices = self.list_voices()
         return voices[0]["id"] if voices else None
 
@@ -114,16 +99,11 @@ class WyomingPiperProvider(TTSProvider):
         format: str = "mp3",
         **extra: Any,
     ) -> str:
-        """Synthesize text to audio file via Wyoming Piper."""
-        from .wyoming_client import WyomingError
-
         client = self._get_client()
         voice_name = voice or self.default_voice()
 
-        # Get raw WAV audio from Piper
         wav_bytes = client.synthesize(text, voice=voice_name)
 
-        # Write WAV to output path (Piper always outputs WAV)
         wav_path = output_path
         if not wav_path.endswith(".wav"):
             wav_path = output_path.rsplit(".", 1)[0] + ".wav"
@@ -131,7 +111,6 @@ class WyomingPiperProvider(TTSProvider):
         with open(wav_path, "wb") as f:
             f.write(wav_bytes)
 
-        # If format is not WAV, convert with ffmpeg if available
         if format.lower() not in ("wav", "pcm"):
             converted = self._convert_audio(wav_path, output_path, format)
             if converted:
@@ -140,29 +119,21 @@ class WyomingPiperProvider(TTSProvider):
         return wav_path
 
     def _convert_audio(self, input_path: str, output_path: str, target_format: str) -> Optional[str]:
-        """Convert audio format using ffmpeg if available."""
         import subprocess
+        import os
 
         if not output_path.endswith(f".{target_format}"):
             output_path = output_path.rsplit(".", 1)[0] + f".{target_format}"
 
         try:
             result = subprocess.run(
-                [
-                    "ffmpeg", "-y", "-i", input_path,
-                    "-acodec", "libmp3lame" if target_format == "mp3" else "copy",
-                    output_path,
-                ],
+                ["ffmpeg", "-y", "-i", input_path, "-acodec", "libmp3lame", output_path],
                 capture_output=True,
                 timeout=30,
             )
             if result.returncode == 0:
-                # Remove intermediate WAV if different path
                 if input_path != output_path:
-                    try:
-                        os.remove(input_path)
-                    except OSError:
-                        pass
+                    os.remove(input_path)
                 return output_path
         except (subprocess.TimeoutExpired, FileNotFoundError):
             pass
@@ -170,18 +141,13 @@ class WyomingPiperProvider(TTSProvider):
         return None
 
     def warm(self) -> None:
-        """Pre-connect to server for faster first synthesis."""
         try:
-            client = self._get_client()
-            client.connect()
-            # Pre-fetch voices
+            self._get_client().connect()
             self.list_voices()
-            logger.info("Wyoming Piper provider warmed up")
         except Exception as e:
-            logger.debug("Warm-up failed (will retry on synthesis): %s", e)
+            logger.debug("Warm-up failed: %s", e)
 
     def release(self) -> None:
-        """Disconnect from server."""
         if self._client is not None:
             try:
                 self._client.disconnect()
@@ -191,29 +157,14 @@ class WyomingPiperProvider(TTSProvider):
 
     @property
     def voice_compatible(self) -> bool:
-        """Piper output is suitable for voice bubble delivery."""
         return True
 
 
 def register(ctx) -> None:
-    """Register the Wyoming Piper TTS provider with Hermes."""
-    config = {}
-
-    # Load config if available
-    try:
-        from hermes_constants import get_hermes_home
-        import yaml
-
-        config_path = os.path.join(get_hermes_home(), "config.yaml")
-        with open(config_path) as f:
-            full_config = yaml.safe_load(f) or {}
-
-        tts_config = full_config.get("tts", {})
-        providers = tts_config.get("providers", {})
-        config = providers.get("wyoming-piper", {})
-    except Exception:
-        pass
-
-    provider = WyomingPiperProvider(config=config)
+    provider = WyomingPiperProvider(
+        host=ctx.get_config("host", "localhost"),
+        port=ctx.get_config("port", 10200),
+        voice=ctx.get_config("voice", ""),
+        timeout=ctx.get_config("timeout", 10),
+    )
     ctx.register_tts_provider(provider)
-    logger.info("Registered Wyoming Piper TTS provider")
