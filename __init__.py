@@ -21,6 +21,7 @@ import os
 import shutil
 import subprocess
 import time
+import wave
 from typing import Any, Dict, Iterator, List, Optional
 
 from agent.tts_provider import TTSProvider
@@ -39,7 +40,7 @@ def _debug(msg: str) -> None:
             f.write(line + "\n")
     except Exception:
         pass
-    logger.warning(msg)
+    logger.debug(msg)
 
 
 class WyomingPiperProvider(TTSProvider):
@@ -166,11 +167,9 @@ class WyomingPiperProvider(TTSProvider):
         """Pipe raw PCM data through ffmpeg to target format."""
         ffmpeg = shutil.which("ffmpeg")
         if not ffmpeg:
-            # Fallback: write as WAV
             wav_path = output_path.rsplit(".", 1)[0] + ".wav"
-            with open(wav_path, "wb") as f:
-                f.write(pcm_data)
-            _debug(f"[{request_id}] ffmpeg not found, wrote raw PCM as WAV")
+            self._write_fallback_wav(pcm_data, rate, width, channels, wav_path)
+            _debug(f"[{request_id}] ffmpeg not found, wrote fallback WAV")
             return wav_path
 
         out_path = output_path if output_path.endswith(f".{target_ext}") else \
@@ -212,9 +211,18 @@ class WyomingPiperProvider(TTSProvider):
 
         # Fallback to WAV
         wav_path = output_path.rsplit(".", 1)[0] + ".wav"
-        with open(wav_path, "wb") as f:
-            f.write(pcm_data)
+        self._write_fallback_wav(pcm_data, rate, width, channels, wav_path)
         return wav_path
+
+    def _write_fallback_wav(self, pcm_data: bytes, rate: int, width: int,
+                             channels: int, wav_path: str) -> None:
+        """Write raw PCM data as a valid WAV file."""
+        with open(wav_path, "wb") as f:
+            with wave.open(f, "wb") as wf:
+                wf.setnchannels(channels)
+                wf.setsampwidth(width)
+                wf.setframerate(rate)
+                wf.writeframes(pcm_data)
 
     def _target_extension(self, format: str) -> str:
         """Determine target file extension from format hint."""
@@ -290,60 +298,92 @@ class WyomingPiperProvider(TTSProvider):
 
         _debug(f"stream() called: text={len(text)} chars, voice={voice_name}")
 
-        # Stream PCM chunks through ffmpeg for Opus encoding
-        proc: Optional[subprocess.Popen] = None
+        # Read first chunk to determine actual audio format before starting ffmpeg
+        stream_iter = client.synthesize_stream(text, voice=voice_name)
         try:
-            ffmpeg = shutil.which("ffmpeg")
-            if not ffmpeg:
-                raise RuntimeError("ffmpeg not found for streaming Opus conversion")
+            first_chunk, fmt_info = next(stream_iter)
+        except StopIteration:
+            return
 
-            cmd = [
-                ffmpeg, "-y",
-                "-f", "s16le",
-                "-ar", "22050",  # Will be updated from first chunk
-                "-ac", "1",
-                "-i", "pipe:0",
-                "-acodec", "libopus",
-                "-b:a", "48k",
-                "-vbr", "on",
-                "-application", "voip",
-                "pipe:1",  # Output to stdout
-            ]
+        if fmt_info is not None:
+            rate, _, channels = fmt_info
+        else:
+            rate, _, channels = 22050, 2, 1
 
-            proc = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-            )
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            raise RuntimeError("ffmpeg not found for streaming Opus conversion")
 
-            for pcm_bytes, fmt_info in client.synthesize_stream(text, voice=voice_name):
+        cmd = [
+            ffmpeg, "-y",
+            "-f", "s16le",
+            "-ar", str(rate),
+            "-ac", str(channels),
+            "-i", "pipe:0",
+            "-acodec", "libopus",
+            "-b:a", "48k",
+            "-vbr", "on",
+            "-application", "voip",
+            "pipe:1",
+        ]
+
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+
+        if proc.stdin is None or proc.stdout is None:
+            if proc.stdin:
+                proc.stdin.close()
+            proc.terminate()
+            raise RuntimeError("ffmpeg failed to open pipes")
+
+        # Use a writer thread to avoid pipe deadlock between stdin and stdout
+        from queue import Queue
+        from threading import Thread
+
+        write_queue: "Queue[Optional[bytes]]" = Queue()
+        _stdin = proc.stdin
+
+        def _writer():
+            while True:
+                data = write_queue.get()
+                if data is None:
+                    _stdin.flush()
+                    break
+                _stdin.write(data)
+                _stdin.flush()
+
+        writer_thread = Thread(target=_writer, daemon=True)
+        writer_thread.start()
+
+        try:
+            write_queue.put(first_chunk)
+
+            for pcm_bytes, fmt_info in stream_iter:
                 if fmt_info is not None:
-                    rate, width, channels = fmt_info
+                    rate, _, channels = fmt_info
                     _debug(f"stream: format={fmt_info}")
-
-                assert proc.stdin is not None
-                assert proc.stdout is not None
-                proc.stdin.write(pcm_bytes)
-                proc.stdin.flush()
+                write_queue.put(pcm_bytes)
 
                 opus_chunk = proc.stdout.read(4096)
                 if opus_chunk:
                     yield opus_chunk
 
-            # Flush and get remaining output
-            assert proc.stdin is not None
-            assert proc.stdout is not None
-            proc.stdin.close()
+            write_queue.put(None)
+            writer_thread.join(timeout=5)
+
+            if proc.stdin:
+                proc.stdin.close()
             remaining = proc.stdout.read()
             if remaining:
                 yield remaining
-
         finally:
-            if proc:
-                if proc.stdin:
-                    proc.stdin.close()
-                proc.wait()
+            if proc.stdin:
+                proc.stdin.close()
+            proc.wait()
 
         _debug("stream() completed")
 

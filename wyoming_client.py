@@ -235,13 +235,12 @@ class WyomingPiperClient:
         text: str,
         voice: Optional[str] = None,
     ) -> Iterator[Tuple[bytes, Tuple[int, int, int]]]:
-        """Synthesize text and yield (pcm_bytes, (rate, width, chunks)) tuples.
+        """Synthesize text and yield (pcm_bytes, (rate, width, channels)) tuples.
 
         Yields raw PCM chunks as they arrive from the server, plus the audio format
         on the first yield. The caller can pipe these directly to ffmpeg.
         """
         self.connect()
-        loop = self._get_loop()
 
         async def _synthesize_stream():
             assert self._client is not None
@@ -287,21 +286,41 @@ class WyomingPiperClient:
                     error_msg = event.data.get("text", "Unknown error")
                     raise WyomingServerError(f"Synthesis error: {error_msg}")
 
-        try:
-            yield from loop.run_until_complete(
-                self._collect_async_stream(_synthesize_stream())
-            )
-        except Exception as e:
-            if isinstance(e, WyomingServerError):
-                raise
-            raise WyomingServerError(f"Synthesis failed: {e}") from e
+        from queue import Queue
+        from threading import Thread
 
-    async def _collect_async_stream(self, async_gen):
-        """Collect async generator into a list of tuples for sync iteration."""
-        results = []
-        async for item in async_gen:
-            results.append(item)
-        return results
+        q: "Queue[Optional[Tuple[bytes, Tuple[int, int, int]]]]" = Queue()
+
+        async def _consume():
+            try:
+                async for item in _synthesize_stream():
+                    q.put(item)
+            except Exception as e:
+                q.put(e)
+            finally:
+                q.put(None)
+
+        thread = Thread(target=self._run_consume, args=(q, _consume), daemon=True)
+        thread.start()
+
+        while True:
+            item = q.get()
+            if item is None:
+                break
+            if isinstance(item, Exception):
+                if isinstance(item, WyomingServerError):
+                    raise item
+                raise WyomingServerError(f"Synthesis failed: {item}") from item
+            yield item
+
+    @staticmethod
+    def _run_consume(q, coro_func):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(coro_func())
+        finally:
+            loop.close()
 
     def is_connected(self) -> bool:
         """Check if the client is currently connected."""

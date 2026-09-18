@@ -22,7 +22,7 @@ Most people use Wyoming Piper through Home Assistant's voice pipeline. This plug
 - Connect to any Wyoming-compatible Piper server
 - 44 languages, 174+ pre-trained voices
 - Voice selection via config or per-request
-- Voice bubble support (Telegram, Discord) — gateway handles Opus conversion
+- Voice bubble support — Opus encoding via ffmpeg
 - Warm-up and connection reuse for fast repeated synthesis
 - Two synthesis modes: `pipe` (efficient) and `stream` (streaming delivery)
 
@@ -71,9 +71,9 @@ Writes PCM directly to ffmpeg stdin, outputs the target format in one pass. No i
 
 **`stream`** — Streaming delivery via `TTSProvider.stream()`:
 ```
-Piper TCP chunks → ffmpeg (streaming) → Opus chunks → gateway
+Piper TCP chunks → ffmpeg → Opus chunks (yielded incrementally)
 ```
-Implements the `stream()` method for providers that support it. Audio chunks are yielded as they arrive, allowing the gateway to begin delivery before synthesis completes. Lower latency for long responses.
+Implements `TTSProvider.stream()` yielding Opus chunks as they arrive. Currently no Hermes consumer dispatches to `TTSProvider.stream()` — CLI voice mode and the dashboard use `StreamingTTSProvider` (raw PCM), a separate interface (Hermes #47896). Has potential future value once Hermes adds generic `stream()` dispatch.
 
 ## Usage
 
