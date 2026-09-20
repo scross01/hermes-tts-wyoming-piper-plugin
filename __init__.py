@@ -27,7 +27,17 @@ from typing import Any, Dict, Iterator, List
 
 from agent.tts_provider import TTSProvider
 
-from .wyoming_client import WyomingError
+try:
+    # Hermes runtime loads this file as the ``tts_wyoming_piper`` package, so a
+    # package-relative import is correct.
+    from .wyoming_client import WyomingError
+except ImportError:
+    # When this file is imported as a standalone module (the repository root
+    # doubles as a package, so pytest's package setup imports ``__init__.py``
+    # directly without package context), relative imports have no parent
+    # package. Fall back to the absolute path, which works once the repository
+    # root is on ``sys.path``.
+    from wyoming_client import WyomingError
 
 logger = logging.getLogger("hermes-wyoming-piper")
 
