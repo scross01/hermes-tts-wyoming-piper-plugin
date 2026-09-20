@@ -1,4 +1,5 @@
 import os
+import subprocess
 import sys
 import tempfile
 import wave
@@ -82,3 +83,63 @@ class TestWyomingPiperProvider:
         mock_client.describe.side_effect = WyomingError("connection failed")
         with patch.object(p, "_get_client", return_value=mock_client):
             assert p.list_voices() == []
+
+    def test_synthesize_stream_to_file_pipes_incrementally(self):
+        p = WyomingPiperProvider()
+        mock_client = MagicMock()
+        mock_client.synthesize_stream.return_value = iter([
+            (b"chunk1", (22050, 2, 1)),
+            (b"chunk2", None),
+            (b"chunk3", None),
+        ])
+
+        captured_iterators = []
+
+        def fake_pipe_stream(request_id, pcm_iter, rate, width, channels, output_path, target_ext):
+            captured_iterators.append(list(pcm_iter))
+            return output_path
+
+        with patch.object(p, "_get_client", return_value=mock_client), \
+             patch.object(p, "_pipe_stream_to_format", side_effect=fake_pipe_stream):
+            p._synthesize_stream_to_file(1, "hello", "/tmp/out.mp3", format="mp3")
+
+        assert len(captured_iterators) == 1
+        assert captured_iterators[0] == [b"chunk1", b"chunk2", b"chunk3"]
+
+
+class TestStreamHangFix:
+    def test_stream_kills_ffmpeg_on_timeout(self):
+        p = WyomingPiperProvider()
+        mock_client = MagicMock()
+        mock_client.synthesize_stream.return_value = iter([(b"\x00\x00" * 100, (22050, 2, 1))])
+        p._client = mock_client
+
+        mock_proc = MagicMock()
+        mock_proc.stdin = MagicMock()
+        mock_proc.stdout = MagicMock()
+        mock_proc.stdout.read.side_effect = [b"", b""]
+        mock_proc.wait.side_effect = [subprocess.TimeoutExpired(cmd="ffmpeg", timeout=10), 0]
+        mock_proc.kill = MagicMock()
+
+        with patch("subprocess.Popen", return_value=mock_proc), \
+             patch("subprocess.DEVNULL"):
+            list(p.stream("hello"))
+
+        mock_proc.kill.assert_called_once()
+
+    def test_pipe_pcm_to_format_raises_when_ffmpeg_missing(self):
+        p = WyomingPiperProvider()
+        with patch("shutil.which", return_value=None), \
+             pytest.raises(RuntimeError, match="ffmpeg not found"):
+            p._pipe_pcm_to_format(1, b"", 22050, 2, 1, "/tmp/out.mp3", "mp3")
+
+    def test_stream_raises_when_ffmpeg_missing(self):
+        p = WyomingPiperProvider()
+        mock_client = MagicMock()
+        mock_client.synthesize_stream.return_value = iter([
+            (b"\x00\x00", (22050, 2, 1)),
+        ])
+        with patch.object(p, "_get_client", return_value=mock_client), \
+             patch("shutil.which", return_value=None), \
+             pytest.raises(RuntimeError, match="ffmpeg not found"):
+            list(p.stream("hello"))

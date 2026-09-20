@@ -33,6 +33,7 @@ logger = logging.getLogger("hermes-wyoming-piper")
 # Debug file logging — gated by plugins.entries.tts-wyoming-piper.settings.debug
 _DEBUG_LOG = os.path.expanduser("~/.hermes/logs/wyoming-piper-debug.log")
 _debug_enabled = False
+_FFMPEG_SHUTDOWN_TIMEOUT = 10  # seconds
 
 def _debug(msg: str) -> None:
     """Write to debug log file and logger when debug mode is on."""
@@ -169,13 +170,17 @@ class WyomingPiperProvider(TTSProvider):
     def _pipe_pcm_to_format(self, request_id: int, pcm_data: bytes,
                             rate: int, width: int, channels: int,
                             output_path: str, target_ext: str) -> str:
-        """Pipe raw PCM data through ffmpeg to target format."""
+        """Pipe raw PCM data through ffmpeg to target format.
+
+        Raises RuntimeError if ffmpeg is not found and the target format
+        requires it (everything except wav/pcm).
+        """
         ffmpeg = shutil.which("ffmpeg")
         if not ffmpeg:
-            wav_path = output_path.rsplit(".", 1)[0] + ".wav"
-            self._write_fallback_wav(pcm_data, rate, width, channels, wav_path)
-            _debug(f"[{request_id}] ffmpeg not found, wrote fallback WAV")
-            return wav_path
+            raise RuntimeError(
+                f"ffmpeg not found; cannot produce '{target_ext}' output. "
+                "Install ffmpeg or request format='wav'."
+            )
 
         out_path = output_path if output_path.endswith(f".{target_ext}") else \
                    output_path.rsplit(".", 1)[0] + f".{target_ext}"
@@ -220,6 +225,72 @@ class WyomingPiperProvider(TTSProvider):
         self._write_fallback_wav(pcm_data, rate, width, channels, wav_path)
         return wav_path
 
+    def _pipe_stream_to_format(self, request_id: int, pcm_iter: Iterator[bytes],
+                               rate: int, width: int, channels: int,
+                               output_path: str, target_ext: str) -> str:
+        """Stream PCM chunks through ffmpeg to target format."""
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            raise RuntimeError(
+                f"ffmpeg not found; cannot produce '{target_ext}' output. "
+                "Install ffmpeg or request format='wav'."
+            )
+
+        out_path = output_path if output_path.endswith(f".{target_ext}") else \
+                   output_path.rsplit(".", 1)[0] + f".{target_ext}"
+
+        cmd = [
+            ffmpeg, "-y",
+            "-f", "s16le",
+            "-ar", str(rate),
+            "-ac", str(channels),
+            "-i", "pipe:0",
+        ]
+
+        if target_ext == "ogg":
+            cmd.extend(["-acodec", "libopus", "-b:a", "48k", "-vbr", "on"])
+        elif target_ext == "mp3":
+            cmd.extend(["-acodec", "libmp3lame"])
+        elif target_ext == "flac":
+            cmd.extend(["-acodec", "flac"])
+
+        cmd.append(out_path)
+
+        proc = None
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            if proc.stdin is None:
+                raise RuntimeError("ffmpeg failed to open stdin pipe")
+
+            for chunk in pcm_iter:
+                proc.stdin.write(chunk)
+            proc.stdin.close()
+
+            result = proc.wait(timeout=30)
+            if result == 0:
+                _debug(f"[{request_id}] piped PCM → {target_ext}: {out_path}")
+                return out_path
+            else:
+                stderr_bytes = proc.stderr.read() if proc.stderr else b""
+                stderr_text = stderr_bytes.decode("utf-8", errors="replace")[:200]
+                _debug(f"[{request_id}] ffmpeg error: {stderr_text}")
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+            _debug(f"[{request_id}] ffmpeg failed: {e}")
+            if proc is not None:
+                if proc.stdin:
+                    proc.stdin.close()
+                proc.kill()
+
+        wav_path = output_path.rsplit(".", 1)[0] + ".wav"
+        self._write_fallback_wav(b"".join(pcm_iter), rate, width, channels, wav_path)
+        _debug(f"[{request_id}] ffmpeg failed, wrote fallback WAV")
+        return wav_path
+
     def _write_fallback_wav(self, pcm_data: bytes, rate: int, width: int,
                              channels: int, wav_path: str) -> None:
         """Write raw PCM data as a valid WAV file."""
@@ -250,40 +321,41 @@ class WyomingPiperProvider(TTSProvider):
         target_ext = self._target_extension(format)
 
         t0 = time.monotonic()
-        chunks_received = 0
-        total_bytes = 0
 
-        # Get audio format from first chunk
-        pcm_chunks = []
-        audio_fmt = None
+        stream_iter = client.synthesize_stream(text, voice=voice_name)
+        first_chunk, fmt_info = next(stream_iter)
+        audio_fmt = fmt_info
 
-        for pcm_bytes, fmt_info in client.synthesize_stream(text, voice=voice_name):
-            if fmt_info is not None:
-                audio_fmt = fmt_info
-            pcm_chunks.append(pcm_bytes)
-            chunks_received += 1
-            total_bytes += len(pcm_bytes)
-
-        elapsed = time.monotonic() - t0
-        _debug(
-            f"[{request_id}] streamed {chunks_received} chunks, {total_bytes} bytes "
-            f"in {elapsed:.2f}s, voice={voice_name}"
-        )
+        def pcm_iter():
+            nonlocal audio_fmt
+            yield first_chunk
+            for pcm_bytes, fmt_info in stream_iter:
+                if fmt_info is not None:
+                    audio_fmt = fmt_info
+                yield pcm_bytes
 
         if audio_fmt is None:
             audio_fmt = (22050, 2, 1)
         rate, width, channels = audio_fmt
 
-        raw_pcm = b"".join(pcm_chunks)
-
         if target_ext in ("wav", "pcm"):
             wav_path = output_path if output_path.endswith(".wav") else output_path.rsplit(".", 1)[0] + ".wav"
+            raw_pcm = b"".join(pcm_iter())
             with open(wav_path, "wb") as f:
                 f.write(raw_pcm)
+            elapsed = time.monotonic() - t0
+            _debug(
+                f"[{request_id}] streamed WAV: {wav_path} in {elapsed:.2f}s, voice={voice_name}"
+            )
             return wav_path
 
-        return self._pipe_pcm_to_format(request_id, raw_pcm, rate, width, channels,
-                                         output_path, target_ext)
+        result_path = self._pipe_stream_to_format(request_id, pcm_iter(), rate, width, channels,
+                                                   output_path, target_ext)
+        elapsed = time.monotonic() - t0
+        _debug(
+            f"[{request_id}] streamed to {target_ext}: {result_path} in {elapsed:.2f}s, voice={voice_name}"
+        )
+        return result_path
 
     def stream(
         self,
@@ -317,7 +389,10 @@ class WyomingPiperProvider(TTSProvider):
 
         ffmpeg = shutil.which("ffmpeg")
         if not ffmpeg:
-            raise RuntimeError("ffmpeg not found for streaming Opus conversion")
+            raise RuntimeError(
+                "ffmpeg not found; cannot produce 'opus' output. "
+                "Install ffmpeg or use mode='pipe' with format='wav'."
+            )
 
         cmd = [
             ffmpeg, "-y",
@@ -388,7 +463,12 @@ class WyomingPiperProvider(TTSProvider):
         finally:
             if proc.stdin:
                 proc.stdin.close()
-            proc.wait()
+            try:
+                proc.wait(timeout=_FFMPEG_SHUTDOWN_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                _debug("stream(): ffmpeg did not exit within timeout, killing")
+                proc.kill()
+                proc.wait()
 
         _debug("stream() completed")
 
