@@ -20,6 +20,7 @@ import logging
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 import uuid
 import wave
@@ -30,14 +31,14 @@ from agent.tts_provider import TTSProvider
 try:
     # Hermes runtime loads this file as the ``tts_wyoming_piper`` package, so a
     # package-relative import is correct.
-    from .wyoming_client import WyomingError
+    from .wyoming_client import WyomingError, WyomingServerError
 except ImportError:
     # When this file is imported as a standalone module (the repository root
     # doubles as a package, so pytest's package setup imports ``__init__.py``
     # directly without package context), relative imports have no parent
     # package. Fall back to the absolute path, which works once the repository
     # root is on ``sys.path``.
-    from wyoming_client import WyomingError
+    from wyoming_client import WyomingError, WyomingServerError
 
 logger = logging.getLogger("hermes-wyoming-piper")
 
@@ -45,6 +46,8 @@ logger = logging.getLogger("hermes-wyoming-piper")
 _DEBUG_LOG = os.path.expanduser("~/.hermes/logs/wyoming-piper-debug.log")
 _debug_enabled = False
 _FFMPEG_SHUTDOWN_TIMEOUT = 10  # seconds
+_VALID_MODES = ("pipe", "stream")
+_VALID_OUTPUT_FORMATS = ("mp3", "ogg", "opus", "wav", "flac", "pcm")
 
 def _debug(msg: str) -> None:
     """Write to debug log file and logger when debug mode is on."""
@@ -72,8 +75,22 @@ class WyomingPiperProvider(TTSProvider):
         self._port = port
         self._voice = voice
         self._timeout = timeout
-        self._mode = mode  # "pipe" or "stream"
-        self._output_format = output_format.lower().strip() or "mp3"
+        normalized_mode = (mode or "pipe").strip().lower()
+        if normalized_mode not in _VALID_MODES:
+            logger.warning(
+                "tts-wyoming-piper: unknown mode %r; falling back to 'pipe'", mode
+            )
+            normalized_mode = "pipe"
+        self._mode = normalized_mode
+
+        normalized_format = (output_format or "mp3").strip().lower()
+        if normalized_format not in _VALID_OUTPUT_FORMATS:
+            logger.warning(
+                "tts-wyoming-piper: unknown output_format %r; falling back to 'mp3'",
+                output_format,
+            )
+            normalized_format = "mp3"
+        self._output_format = normalized_format
         self._voice_compatible = voice_compatible
         self._client = None
         self._voices: List[Dict[str, Any]] | None = None
@@ -248,6 +265,7 @@ class WyomingPiperProvider(TTSProvider):
         # Fallback to WAV
         wav_path = output_path.rsplit(".", 1)[0] + ".wav"
         self._write_wav(pcm_data, rate, width, channels, wav_path)
+        logger.warning("ffmpeg failed; wrote fallback WAV: %s", wav_path)
         return wav_path
 
     def _pipe_stream_to_format(self, request_id: str, pcm_iter: Iterator[bytes],
@@ -266,6 +284,7 @@ class WyomingPiperProvider(TTSProvider):
 
         cmd = self._build_ffmpeg_cmd(ffmpeg, rate, channels, target_ext, out_path)
 
+        consumed: List[bytes] = []
         proc = None
         try:
             proc = subprocess.Popen(
@@ -279,6 +298,7 @@ class WyomingPiperProvider(TTSProvider):
 
             for chunk in pcm_iter:
                 proc.stdin.write(chunk)
+                consumed.append(chunk)
             proc.stdin.close()
 
             result = proc.wait(timeout=30)
@@ -297,7 +317,8 @@ class WyomingPiperProvider(TTSProvider):
                 proc.kill()
 
         wav_path = output_path.rsplit(".", 1)[0] + ".wav"
-        self._write_wav(b"".join(pcm_iter), rate, width, channels, wav_path)
+        self._write_wav(b"".join(consumed), rate, width, channels, wav_path)
+        logger.warning("ffmpeg failed; wrote fallback WAV: %s", wav_path)
         _debug(f"[{request_id}] ffmpeg failed, wrote fallback WAV")
         return wav_path
 
@@ -333,7 +354,10 @@ class WyomingPiperProvider(TTSProvider):
         t0 = time.monotonic()
 
         stream_iter = client.synthesize_stream(text, voice=voice_name)
-        first_chunk, fmt_info = next(stream_iter)
+        try:
+            first_chunk, fmt_info = next(stream_iter)
+        except StopIteration as e:
+            raise WyomingServerError("Server returned no audio") from e
         audio_fmt = fmt_info
 
         def pcm_iter():
@@ -409,11 +433,13 @@ class WyomingPiperProvider(TTSProvider):
 
         cmd = self._build_ffmpeg_cmd(ffmpeg, rate, channels, "opus", "pipe:1")
 
+        # Temp file must outlive Popen and is read/closed in the finally below.
+        stderr_file = tempfile.TemporaryFile()  # noqa: SIM115
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=stderr_file,
         )
 
         if proc.stdin is None or proc.stdout is None:
@@ -441,12 +467,12 @@ class WyomingPiperProvider(TTSProvider):
         writer_thread = Thread(target=_writer, daemon=True)
         writer_thread.start()
 
+        completed = False
         try:
             write_queue.put(first_chunk)
 
             for pcm_bytes, fmt_info in stream_iter:
                 if fmt_info is not None:
-                    rate, _, channels = fmt_info
                     _debug(f"stream: format={fmt_info}")
                 write_queue.put(pcm_bytes)
 
@@ -462,6 +488,7 @@ class WyomingPiperProvider(TTSProvider):
             remaining = proc.stdout.read()
             if remaining:
                 yield remaining
+            completed = True
         finally:
             if proc.stdin:
                 proc.stdin.close()
@@ -471,6 +498,13 @@ class WyomingPiperProvider(TTSProvider):
                 _debug("stream(): ffmpeg did not exit within timeout, killing")
                 proc.kill()
                 proc.wait()
+            stderr_file.seek(0)
+            stderr_text = stderr_file.read().decode("utf-8", errors="replace")[-500:]
+            stderr_file.close()
+            if completed and proc.returncode != 0:
+                raise RuntimeError(
+                    f"ffmpeg stream encoding failed (rc={proc.returncode}): {stderr_text}"
+                )
 
         _debug("stream() completed")
 

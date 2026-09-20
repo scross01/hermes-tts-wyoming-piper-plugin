@@ -1,3 +1,4 @@
+import logging
 import os
 import subprocess
 import sys
@@ -7,7 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from wyoming_client import WyomingError, WyomingVoice
+from wyoming_client import WyomingError, WyomingServerError, WyomingVoice
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -198,6 +199,41 @@ class TestPipeModeRawPcm:
             assert wf.readframes(wf.getnframes()) == b"\x00\x00" * 20
 
 
+class TestConfigValidation:
+    def test_unknown_mode_warns_and_falls_back(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            p = WyomingPiperProvider(mode="straming")
+        assert p._mode == "pipe"
+        assert "unknown mode 'straming'" in caplog.text
+
+    def test_unknown_output_format_warns_and_falls_back(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            p = WyomingPiperProvider(output_format="og")
+        assert p._output_format == "mp3"
+        assert "unknown output_format 'og'" in caplog.text
+
+    def test_valid_values_do_not_warn(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="hermes-wyoming-piper"):
+            p = WyomingPiperProvider(mode="stream", output_format="flac")
+        assert p._mode == "stream"
+        assert p._output_format == "flac"
+        assert "unknown" not in caplog.text
+
+    def test_values_are_case_and_whitespace_insensitive(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="hermes-wyoming-piper"):
+            p = WyomingPiperProvider(mode="  Pipe ", output_format="MP3")
+        assert p._mode == "pipe"
+        assert p._output_format == "mp3"
+        assert "unknown" not in caplog.text
+
+    def test_empty_strings_fall_back_without_warning(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="hermes-wyoming-piper"):
+            p = WyomingPiperProvider(mode="", output_format="")
+        assert p._mode == "pipe"
+        assert p._output_format == "mp3"
+        assert "unknown" not in caplog.text
+
+
 class TestStreamHangFix:
     def test_stream_kills_ffmpeg_on_timeout(self):
         p = WyomingPiperProvider()
@@ -211,12 +247,113 @@ class TestStreamHangFix:
         mock_proc.stdout.read.side_effect = [b"", b""]
         mock_proc.wait.side_effect = [subprocess.TimeoutExpired(cmd="ffmpeg", timeout=10), 0]
         mock_proc.kill = MagicMock()
+        mock_proc.returncode = 0
 
         with patch("subprocess.Popen", return_value=mock_proc), \
              patch("subprocess.DEVNULL"):
             list(p.stream("hello"))
 
         mock_proc.kill.assert_called_once()
+
+
+class TestPipeStreamFallback:
+    @staticmethod
+    def _mock_proc(returncode=1):
+        proc = MagicMock()
+        proc.stdin = MagicMock()
+        proc.stdout = MagicMock()
+        proc.stderr = MagicMock()
+        proc.wait = MagicMock(return_value=returncode)
+        return proc
+
+    def test_fallback_wav_contains_all_fed_audio(self, tmp_path):
+        p = WyomingPiperProvider()
+        chunks = [b"aa", b"bb", b"cc"]
+        proc = self._mock_proc(returncode=1)
+        with patch("subprocess.Popen", return_value=proc), \
+             patch.object(p, "_write_wav") as mock_wav:
+            out = p._pipe_stream_to_format(
+                "req1", iter(chunks), 22050, 2, 1,
+                str(tmp_path / "out.mp3"), "mp3",
+            )
+        assert out == str(tmp_path / "out.wav")
+        mock_wav.assert_called_once()
+        assert mock_wav.call_args.args[0] == b"aabbcc"  # regression: was b"" (exhausted iterator)
+
+    def test_fallback_on_broken_pipe_contains_partial_audio(self, tmp_path):
+        p = WyomingPiperProvider()
+        proc = self._mock_proc()
+        proc.stdin.write.side_effect = [None, BrokenPipeError("dead"), None]
+        with patch("subprocess.Popen", return_value=proc), \
+             patch.object(p, "_write_wav") as mock_wav:
+            p._pipe_stream_to_format(
+                "req1", iter([b"aa", b"bb", b"cc"]), 22050, 2, 1,
+                str(tmp_path / "out.mp3"), "mp3",
+            )
+        assert mock_wav.call_args.args[0] == b"aa"  # best available: what was fed
+        proc.kill.assert_called_once()
+
+    def test_success_returns_out_path_without_fallback(self, tmp_path):
+        p = WyomingPiperProvider()
+        proc = self._mock_proc(returncode=0)
+        with patch("subprocess.Popen", return_value=proc), \
+             patch.object(p, "_write_wav") as mock_wav:
+            out = p._pipe_stream_to_format(
+                "req1", iter([b"aa"]), 22050, 2, 1,
+                str(tmp_path / "out.mp3"), "mp3",
+            )
+        assert out == str(tmp_path / "out.mp3")
+        mock_wav.assert_not_called()
+
+
+class TestStreamFfmpegFailure:
+    def test_stream_raises_on_nonzero_returncode(self):
+        p = WyomingPiperProvider()
+        mock_client = MagicMock()
+        mock_client.synthesize_stream.return_value = iter([(b"in1", (22050, 2, 1))])
+        p._client = mock_client
+
+        mock_proc = MagicMock()
+        mock_proc.stdin = MagicMock()
+        mock_proc.stdout = MagicMock()
+        mock_proc.stdout.read.side_effect = [b"out1"]   # loop body never runs; read once for `remaining`
+        mock_proc.wait = MagicMock()
+        mock_proc.returncode = 1
+
+        def fake_popen(cmd, **kwargs):
+            kwargs["stderr"].write(b"some ffmpeg failure detail")
+            kwargs["stderr"].seek(0)
+            return mock_proc
+
+        with patch("subprocess.Popen", side_effect=fake_popen), \
+             pytest.raises(RuntimeError, match="rc=1"):
+            list(p.stream("hello"))
+
+    def test_stream_completes_on_zero_returncode(self):
+        p = WyomingPiperProvider()
+        mock_client = MagicMock()
+        mock_client.synthesize_stream.return_value = iter([(b"in1", (22050, 2, 1))])
+        p._client = mock_client
+
+        mock_proc = MagicMock()
+        mock_proc.stdin = MagicMock()
+        mock_proc.stdout = MagicMock()
+        mock_proc.stdout.read.side_effect = [b"out1"]
+        mock_proc.wait = MagicMock()
+        mock_proc.returncode = 0
+
+        with patch("subprocess.Popen", return_value=mock_proc):
+            chunks = list(p.stream("hello"))
+        assert chunks == [b"out1"]
+
+    def test_stream_to_file_empty_stream_raises(self):
+        p = WyomingPiperProvider()
+        mock_client = MagicMock()
+        mock_client.synthesize_stream.return_value = iter([])
+        with patch.object(p, "_get_client", return_value=mock_client), \
+             pytest.raises(WyomingServerError, match="no audio"):
+            p._synthesize_stream_to_file("req1", "hello", "/tmp/out.mp3",
+                                         voice="v", format="mp3")
 
     def test_pipe_pcm_to_format_raises_when_ffmpeg_missing(self):
         p = WyomingPiperProvider()

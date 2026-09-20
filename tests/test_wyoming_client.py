@@ -1,11 +1,18 @@
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from wyoming_client import WyomingPiperClient, WyomingVoice
+from wyoming_client import (
+    WyomingError,
+    WyomingPiperClient,
+    WyomingServerError,
+    WyomingVoice,
+)
 
 
 class TestWyomingVoice:
@@ -130,3 +137,50 @@ class TestSynthesizeRawPcm:
         assert result == pcm
         assert not result.startswith(b"RIFF")
         assert client.audio_format == (22050, 2, 1)
+
+
+class TestSynthesizeStreamErrors:
+    def test_connection_refused_raises_wyoming_error(self):
+        """Regression: ConnectionRefusedError used to vanish (empty stream)."""
+        client = WyomingPiperClient(host="127.0.0.1", port=1, timeout=2.0)
+        with pytest.raises(WyomingError):
+            list(client.synthesize_stream("hello"))
+
+    def test_dns_failure_raises_wyoming_error(self):
+        client = WyomingPiperClient(host="nonexistent.invalid", port=10200, timeout=5.0)
+        with pytest.raises(WyomingError):
+            list(client.synthesize_stream("hello"))
+
+    def test_midstream_error_event_raises_wyoming_server_error(self):
+        from wyoming.event import Event
+
+        client = WyomingPiperClient()
+        mock_conn = MagicMock()
+        mock_conn.connect = AsyncMock()
+        mock_conn.disconnect = AsyncMock()
+        mock_conn.write_event = AsyncMock()
+        mock_conn.read_event = AsyncMock(side_effect=[
+            Event(type="error", data={"text": "voice not found"}),
+        ])
+        with patch("wyoming_client.AsyncTcpClient", return_value=mock_conn), \
+             pytest.raises(WyomingServerError, match="Synthesis error: voice not found"):
+            list(client.synthesize_stream("hello"))
+
+    def test_successful_stream_still_yields(self):
+        """Guard: the broadened except must not change the happy path."""
+        from wyoming.audio import AudioChunk
+        from wyoming.event import Event
+
+        client = WyomingPiperClient()
+        mock_conn = MagicMock()
+        mock_conn.connect = AsyncMock()
+        mock_conn.disconnect = AsyncMock()
+        mock_conn.write_event = AsyncMock()
+        mock_conn.read_event = AsyncMock(side_effect=[
+            Event(type="audio-start", data={"rate": 22050, "width": 2, "channels": 1}),
+            AudioChunk(audio=b"\x01\x02", rate=22050, width=2, channels=1).event(),
+            Event(type="audio-stop", data={}),
+        ])
+        with patch("wyoming_client.AsyncTcpClient", return_value=mock_conn):
+            items = list(client.synthesize_stream("hello"))
+        assert items == [(b"\x01\x02", (22050, 2, 1))]

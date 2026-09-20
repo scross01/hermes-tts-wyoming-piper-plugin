@@ -225,11 +225,15 @@ class WyomingPiperClient:
 
         Each call creates its own event loop + client connection in a worker thread
         to avoid "Future attached to a different loop" errors from the wyoming library.
+
+        Errors raised on the worker thread — connection failures, timeouts,
+        and server errors alike — are re-raised in the consuming thread as
+        WyomingServerError.
         """
         from queue import Queue
         from threading import Thread
 
-        q: Queue[Tuple[bytes, Tuple[int, int, int]] | None] = Queue()
+        q: Queue[Tuple[bytes, Tuple[int, int, int]] | Exception | None] = Queue()
 
         _host, _port, _timeout = self.host, self.port, self.timeout
 
@@ -284,7 +288,9 @@ class WyomingPiperClient:
                         await client.disconnect()
 
                 loop.run_until_complete(_run())
-            except (TimeoutError, WyomingError) as e:
+            # Forward everything to the consumer (re-raised as WyomingServerError
+            # there); asyncio.CancelledError still escapes (BaseException).
+            except Exception as e:  # noqa: BLE001
                 q.put(e)
             finally:
                 q.put(None)
