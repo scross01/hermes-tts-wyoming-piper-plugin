@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from typing import Any, Dict, Iterator, List, Self, Tuple
 
 from wyoming.audio import AudioChunk
@@ -44,6 +45,11 @@ class WyomingVoice:
 class WyomingPiperClient:
     """
     Client for connecting to a Wyoming Protocol Piper TTS server.
+
+    The synchronous methods (connect, disconnect, synthesize) are serialized
+    with an internal lock so concurrent calls from different threads cannot
+    interleave on the shared connection; synthesize_stream() uses its own
+    per-call connection instead.
     """
 
     def __init__(
@@ -55,6 +61,7 @@ class WyomingPiperClient:
         self.host = host
         self.port = port
         self.timeout = timeout
+        self._lock = threading.RLock()
         self._client: AsyncTcpClient | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._voices: List[WyomingVoice] | None = None
@@ -69,50 +76,51 @@ class WyomingPiperClient:
 
     def connect(self) -> None:
         """Establish TCP connection and query server capabilities."""
-        if self._client is not None:
-            return
+        with self._lock:
+            if self._client is not None:
+                return
 
-        loop = self._get_loop()
+            loop = self._get_loop()
 
-        async def _connect():
-            client = AsyncTcpClient(
-                self.host,
-                self.port,
-                connect_timeout=self.timeout,
-                read_timeout=self.timeout,
-            )
-            await client.connect()
-
-            # Send describe to get server capabilities
-            await client.write_event(Event(type="describe"))
-            info_event = await client.read_event()
-            if info_event is None or info_event.type != "info":
-                raise WyomingConnectionError(
-                    f"Expected 'info' event, got: {info_event.type if info_event else 'None'}"
+            async def _connect():
+                client = AsyncTcpClient(
+                    self.host,
+                    self.port,
+                    connect_timeout=self.timeout,
+                    read_timeout=self.timeout,
                 )
+                await client.connect()
 
-            return client, info_event
+                # Send describe to get server capabilities
+                await client.write_event(Event(type="describe"))
+                info_event = await client.read_event()
+                if info_event is None or info_event.type != "info":
+                    raise WyomingConnectionError(
+                        f"Expected 'info' event, got: {info_event.type if info_event else 'None'}"
+                    )
 
-        try:
-            self._client, info_event = loop.run_until_complete(_connect())
-            self._info = info_event.data
+                return client, info_event
 
-            # Parse voices from info event
-            self._voices = self._parse_voices_from_info(self._info)
+            try:
+                self._client, info_event = loop.run_until_complete(_connect())
+                self._info = info_event.data
 
-            logger.info("Connected to Wyoming server at %s:%d", self.host, self.port)
-            logger.info(
-                "Server has %d voices: %s",
-                len(self._voices),
-                [v.name for v in self._voices[:5]],
-            )
-        except Exception as e:
-            self._client = None
-            if isinstance(e, WyomingConnectionError):
-                raise
-            raise WyomingConnectionError(
-                f"Failed to connect to {self.host}:{self.port}: {e}"
-            ) from e
+                # Parse voices from info event
+                self._voices = self._parse_voices_from_info(self._info)
+
+                logger.info("Connected to Wyoming server at %s:%d", self.host, self.port)
+                logger.info(
+                    "Server has %d voices: %s",
+                    len(self._voices),
+                    [v.name for v in self._voices[:5]],
+                )
+            except Exception as e:
+                self._client = None
+                if isinstance(e, WyomingConnectionError):
+                    raise
+                raise WyomingConnectionError(
+                    f"Failed to connect to {self.host}:{self.port}: {e}"
+                ) from e
 
     def _parse_voices_from_info(self, info: Dict[str, Any]) -> List[WyomingVoice]:
         """Parse voice list from server info event."""
@@ -129,22 +137,23 @@ class WyomingPiperClient:
 
     def disconnect(self) -> None:
         """Close the TCP connection."""
-        if self._client is not None:
-            loop = self._get_loop()
+        with self._lock:
+            if self._client is not None:
+                loop = self._get_loop()
 
-            async def _disconnect():
-                if self._client:
-                    await self._client.disconnect()
+                async def _disconnect():
+                    if self._client:
+                        await self._client.disconnect()
 
-            try:
-                loop.run_until_complete(_disconnect())
-            except WyomingError as e:
-                logger.debug("Disconnect failed: %s", e)
-            self._client = None
-            self._voices = None
-            self._info = None
-            self._audio_format = None
-            logger.info("Disconnected from Wyoming server")
+                try:
+                    loop.run_until_complete(_disconnect())
+                except WyomingError as e:
+                    logger.debug("Disconnect failed: %s", e)
+                self._client = None
+                self._voices = None
+                self._info = None
+                self._audio_format = None
+                logger.info("Disconnected from Wyoming server")
 
     def describe(self) -> List[WyomingVoice]:
         """Get available voices (cached from connect)."""
@@ -163,55 +172,56 @@ class WyomingPiperClient:
         voice: str | None = None,
     ) -> bytes:
         """Synthesize text to raw PCM audio bytes. Format (rate, width, channels) is available via the audio_format property."""
-        self.connect()
-        loop = self._get_loop()
+        with self._lock:
+            self.connect()
+            loop = self._get_loop()
 
-        async def _synthesize():
-            assert self._client is not None
+            async def _synthesize():
+                assert self._client is not None
 
-            synthesize_voice = None
-            if voice:
-                synthesize_voice = SynthesizeVoice(name=voice)
+                synthesize_voice = None
+                if voice:
+                    synthesize_voice = SynthesizeVoice(name=voice)
 
-            synthesize = Synthesize(text=text, voice=synthesize_voice)
-            await self._client.write_event(synthesize.event())
+                synthesize = Synthesize(text=text, voice=synthesize_voice)
+                await self._client.write_event(synthesize.event())
 
-            audio_chunks: List[bytes] = []
-            sample_rate = 22050
-            sample_width = 2
-            channels = 1
+                audio_chunks: List[bytes] = []
+                sample_rate = 22050
+                sample_width = 2
+                channels = 1
 
-            while True:
-                event = await self._client.read_event()
-                if event is None:
-                    raise WyomingServerError("Connection closed during synthesis")
+                while True:
+                    event = await self._client.read_event()
+                    if event is None:
+                        raise WyomingServerError("Connection closed during synthesis")
 
-                if event.type == "audio-start":
-                    sample_rate = event.data.get("rate", 22050)
-                    sample_width = event.data.get("width", 2)
-                    channels = event.data.get("channels", 1)
+                    if event.type == "audio-start":
+                        sample_rate = event.data.get("rate", 22050)
+                        sample_width = event.data.get("width", 2)
+                        channels = event.data.get("channels", 1)
 
-                elif event.type == "audio-chunk":
-                    chunk = AudioChunk.from_event(event)
-                    audio_chunks.append(chunk.audio)
+                    elif event.type == "audio-chunk":
+                        chunk = AudioChunk.from_event(event)
+                        audio_chunks.append(chunk.audio)
 
-                elif event.type == "audio-stop" or event.type == "synthesize-stopped":
-                    break
+                    elif event.type == "audio-stop" or event.type == "synthesize-stopped":
+                        break
 
-                elif event.type == "error":
-                    error_msg = event.data.get("text", "Unknown error")
-                    raise WyomingServerError(f"Synthesis error: {error_msg}")
+                    elif event.type == "error":
+                        error_msg = event.data.get("text", "Unknown error")
+                        raise WyomingServerError(f"Synthesis error: {error_msg}")
 
-            self._audio_format = (sample_rate, sample_width, channels)
+                self._audio_format = (sample_rate, sample_width, channels)
 
-            return b"".join(audio_chunks)
+                return b"".join(audio_chunks)
 
-        try:
-            return loop.run_until_complete(_synthesize())
-        except Exception as e:
-            if isinstance(e, WyomingServerError):
-                raise
-            raise WyomingServerError(f"Synthesis failed: {e}") from e
+            try:
+                return loop.run_until_complete(_synthesize())
+            except Exception as e:
+                if isinstance(e, WyomingServerError):
+                    raise
+                raise WyomingServerError(f"Synthesis failed: {e}") from e
 
     def synthesize_stream(
         self,

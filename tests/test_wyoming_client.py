@@ -1,5 +1,7 @@
+import asyncio
 import os
 import sys
+import threading
 
 import pytest
 
@@ -165,6 +167,50 @@ class TestSynthesizeStreamErrors:
         with patch("wyoming_client.AsyncTcpClient", return_value=mock_conn), \
              pytest.raises(WyomingServerError, match="Synthesis error: voice not found"):
             list(client.synthesize_stream("hello"))
+
+
+class TestThreadSafety:
+    def test_lock_is_reentrant(self):
+        client = WyomingPiperClient()
+        # Nested on purpose: re-entering the lock must not deadlock (plain Lock would).
+        with client._lock:  # noqa: SIM117
+            with client._lock:
+                pass
+
+    def test_concurrent_synthesize_serialized(self):
+        """Two threads calling synthesize() must never overlap inside the
+        event-loop section. Without the lock, both threads would routinely be
+        inside read_event at once; with it, max_in_flight stays at 1."""
+        from wyoming.event import Event
+
+        client = WyomingPiperClient()
+        state = {"in_flight": 0, "max": 0}
+        lock_for_state = threading.Lock()
+
+        async def slow_read(*args, **kwargs):
+            with lock_for_state:
+                state["in_flight"] += 1
+                state["max"] = max(state["max"], state["in_flight"])
+            await asyncio.sleep(0.05)
+            with lock_for_state:
+                state["in_flight"] -= 1
+            return Event(type="audio-stop", data={})
+
+        mock_conn = MagicMock()
+        mock_conn.write_event = AsyncMock()
+        mock_conn.read_event = AsyncMock(side_effect=slow_read)
+        client._client = mock_conn  # skips connect(); loop section still runs
+
+        threads = [
+            threading.Thread(target=client.synthesize, args=("hello",))
+            for _ in range(2)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert state["max"] == 1
 
     def test_successful_stream_still_yields(self):
         """Guard: the broadened except must not change the happy path."""
