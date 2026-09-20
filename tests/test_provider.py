@@ -116,9 +116,9 @@ class TestRequestId:
         mock_client.audio_format = (22050, 2, 1)
         p._client = mock_client
 
-        with patch("uuid.uuid4", return_value=fixed_uuid):
-            with patch("tts_wyoming_piper._debug") as mock_debug:
-                p.synthesize("hello", "/tmp/out.mp3")
+        with patch("uuid.uuid4", return_value=fixed_uuid), \
+             patch("tts_wyoming_piper._debug") as mock_debug:
+            p.synthesize("hello", "/tmp/out.mp3")
 
         first_call_arg = mock_debug.call_args[0][0]
         assert fixed_uuid in first_call_arg
