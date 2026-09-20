@@ -89,7 +89,7 @@ Or use the `text_to_speech` tool — it routes through your Piper server automat
 
 ## Requirements
 
-- Python 3.9+
+- Python 3.12+
 - Network access to the Piper server
 - ffmpeg (for Opus/MP3 output)
 

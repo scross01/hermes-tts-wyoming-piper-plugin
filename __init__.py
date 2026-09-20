@@ -22,9 +22,11 @@ import shutil
 import subprocess
 import time
 import wave
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List
 
 from agent.tts_provider import TTSProvider
+
+from wyoming_client import WyomingError
 
 logger = logging.getLogger("hermes-wyoming-piper")
 
@@ -41,8 +43,8 @@ def _debug(msg: str) -> None:
     try:
         with open(_DEBUG_LOG, "a") as f:
             f.write(line + "\n")
-    except Exception:
-        pass
+    except OSError as e:
+        logger.debug("Failed to write debug log: %s", e)
     logger.debug(msg)
 
 
@@ -59,7 +61,7 @@ class WyomingPiperProvider(TTSProvider):
         self._timeout = timeout
         self._mode = mode  # "pipe" or "stream"
         self._client = None
-        self._voices: Optional[List[Dict[str, Any]]] = None
+        self._voices: List[Dict[str, Any]] | None = None
 
     @property
     def name(self) -> str:
@@ -69,7 +71,7 @@ class WyomingPiperProvider(TTSProvider):
         if self._client is not None:
             return self._client
 
-        from .wyoming_client import WyomingPiperClient
+        from wyoming_client import WyomingPiperClient
 
         self._client = WyomingPiperClient(
             host=self._host,
@@ -94,11 +96,11 @@ class WyomingPiperProvider(TTSProvider):
                 for v in wyoming_voices
             ]
             return self._voices
-        except Exception as e:
+        except WyomingError as e:
             logger.warning("Failed to list voices: %s", e)
             return []
 
-    def default_voice(self) -> Optional[str]:
+    def default_voice(self) -> str | None:
         if self._voice:
             return self._voice
         voices = self.list_voices()
@@ -111,9 +113,9 @@ class WyomingPiperProvider(TTSProvider):
         text: str,
         output_path: str,
         *,
-        voice: Optional[str] = None,
-        model: Optional[str] = None,
-        speed: Optional[float] = None,
+        voice: str | None = None,
+        model: str | None = None,
+        speed: float | None = None,
         format: str = "mp3",
         **extra: Any,
     ) -> str:
@@ -131,7 +133,7 @@ class WyomingPiperProvider(TTSProvider):
                                      voice=voice, format=format)
 
     def _synthesize_pipe(self, request_id: int, text: str, output_path: str,
-                         voice: Optional[str] = None, format: str = "mp3") -> str:
+                         voice: str | None = None, format: str = "mp3") -> str:
         """Option 1: Pipe PCM directly to ffmpeg, skip WAV/MP3 intermediaries."""
         client = self._get_client()
         voice_name = voice or self.default_voice()
@@ -203,6 +205,7 @@ class WyomingPiperProvider(TTSProvider):
                 input=pcm_data,
                 capture_output=True,
                 timeout=30,
+                check=False,
             )
             if result.returncode == 0:
                 _debug(f"[{request_id}] piped PCM → {target_ext}: {out_path}")
@@ -220,12 +223,11 @@ class WyomingPiperProvider(TTSProvider):
     def _write_fallback_wav(self, pcm_data: bytes, rate: int, width: int,
                              channels: int, wav_path: str) -> None:
         """Write raw PCM data as a valid WAV file."""
-        with open(wav_path, "wb") as f:
-            with wave.open(f, "wb") as wf:
-                wf.setnchannels(channels)
-                wf.setsampwidth(width)
-                wf.setframerate(rate)
-                wf.writeframes(pcm_data)
+        with open(wav_path, "wb") as f, wave.open(f, "wb") as wf:
+            wf.setnchannels(channels)
+            wf.setsampwidth(width)
+            wf.setframerate(rate)
+            wf.writeframes(pcm_data)
 
     def _target_extension(self, format: str) -> str:
         """Determine target file extension from format hint."""
@@ -241,7 +243,7 @@ class WyomingPiperProvider(TTSProvider):
     # --- Option 2: Streaming delivery ---
 
     def _synthesize_stream_to_file(self, request_id: int, text: str, output_path: str,
-                                   voice: Optional[str] = None, format: str = "mp3") -> str:
+                                   voice: str | None = None, format: str = "mp3") -> str:
         """Option 2: Stream PCM chunks through ffmpeg as they arrive."""
         client = self._get_client()
         voice_name = voice or self.default_voice()
@@ -287,8 +289,8 @@ class WyomingPiperProvider(TTSProvider):
         self,
         text: str,
         *,
-        voice: Optional[str] = None,
-        model: Optional[str] = None,
+        voice: str | None = None,
+        model: str | None = None,
         format: str = "opus",
         **extra: Any,
     ) -> Iterator[bytes]:
@@ -347,7 +349,7 @@ class WyomingPiperProvider(TTSProvider):
         from queue import Queue
         from threading import Thread
 
-        write_queue: "Queue[Optional[bytes]]" = Queue()
+        write_queue: Queue[bytes | None] = Queue()
         _stdin = proc.stdin
 
         def _writer():
@@ -394,15 +396,15 @@ class WyomingPiperProvider(TTSProvider):
         try:
             self._get_client().connect()
             self.list_voices()
-        except Exception as e:
+        except WyomingError as e:
             logger.debug("Warm-up failed: %s", e)
 
     def release(self) -> None:
         if self._client is not None:
             try:
                 self._client.disconnect()
-            except Exception:
-                pass
+            except WyomingError as e:
+                logger.debug("Disconnect failed during release: %s", e)
             self._client = None
 
     @property

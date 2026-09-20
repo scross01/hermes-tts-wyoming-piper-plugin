@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from wyoming_client import WyomingVoice
+from wyoming_client import WyomingError, WyomingVoice
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -79,6 +79,6 @@ class TestWyomingPiperProvider:
     def test_list_voices_returns_empty_on_failure(self):
         p = WyomingPiperProvider()
         mock_client = MagicMock()
-        mock_client.describe.side_effect = Exception("connection failed")
+        mock_client.describe.side_effect = WyomingError("connection failed")
         with patch.object(p, "_get_client", return_value=mock_client):
             assert p.list_voices() == []

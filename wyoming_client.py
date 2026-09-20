@@ -10,9 +10,9 @@ import asyncio
 import io
 import logging
 import wave
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Self, Tuple
 
-from wyoming.audio import AudioChunk, AudioStart, AudioStop
+from wyoming.audio import AudioChunk
 from wyoming.client import AsyncTcpClient
 from wyoming.event import Event
 from wyoming.tts import Synthesize, SynthesizeVoice
@@ -22,23 +22,20 @@ logger = logging.getLogger("hermes-wyoming-piper")
 
 class WyomingError(Exception):
     """Base error for Wyoming protocol operations."""
-    pass
 
 
 class WyomingConnectionError(WyomingError):
     """Connection to Wyoming server failed."""
-    pass
 
 
 class WyomingServerError(WyomingError):
     """Server returned an error."""
-    pass
 
 
 class WyomingVoice:
     """Represents a voice available on the Piper server."""
 
-    def __init__(self, name: str, languages: Optional[List[str]] = None):
+    def __init__(self, name: str, languages: List[str] | None = None):
         self.name = name
         self.languages = languages or []
 
@@ -60,11 +57,11 @@ class WyomingPiperClient:
         self.host = host
         self.port = port
         self.timeout = timeout
-        self._client: Optional[AsyncTcpClient] = None
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._voices: Optional[List[WyomingVoice]] = None
-        self._info: Optional[Dict[str, Any]] = None
-        self._audio_format: Optional[Tuple[int, int, int]] = None  # (rate, width, channels)
+        self._client: AsyncTcpClient | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._voices: List[WyomingVoice] | None = None
+        self._info: Dict[str, Any] | None = None
+        self._audio_format: Tuple[int, int, int] | None = None  # (rate, width, channels)
 
     def _get_loop(self) -> asyncio.AbstractEventLoop:
         """Get or create event loop."""
@@ -143,8 +140,8 @@ class WyomingPiperClient:
 
             try:
                 loop.run_until_complete(_disconnect())
-            except Exception:
-                pass
+            except WyomingError as e:
+                logger.debug("Disconnect failed: %s", e)
             self._client = None
             self._voices = None
             self._info = None
@@ -158,14 +155,14 @@ class WyomingPiperClient:
         return self._voices or []
 
     @property
-    def audio_format(self) -> Optional[Tuple[int, int, int]]:
+    def audio_format(self) -> Tuple[int, int, int] | None:
         """Last known audio format (rate, width, channels) from synthesis."""
         return self._audio_format
 
     def synthesize(
         self,
         text: str,
-        voice: Optional[str] = None,
+        voice: str | None = None,
     ) -> bytes:
         """Synthesize text to WAV audio bytes."""
         self.connect()
@@ -200,10 +197,7 @@ class WyomingPiperClient:
                     chunk = AudioChunk.from_event(event)
                     audio_chunks.append(chunk.audio)
 
-                elif event.type == "audio-stop":
-                    break
-
-                elif event.type == "synthesize-stopped":
+                elif event.type == "audio-stop" or event.type == "synthesize-stopped":
                     break
 
                 elif event.type == "error":
@@ -233,7 +227,7 @@ class WyomingPiperClient:
     def synthesize_stream(
         self,
         text: str,
-        voice: Optional[str] = None,
+        voice: str | None = None,
     ) -> Iterator[Tuple[bytes, Tuple[int, int, int]]]:
         """Synthesize text and yield (pcm_bytes, (rate, width, channels)) tuples.
 
@@ -246,7 +240,7 @@ class WyomingPiperClient:
         from queue import Queue
         from threading import Thread
 
-        q: "Queue[Optional[Tuple[bytes, Tuple[int, int, int]]]]" = Queue()
+        q: Queue[Tuple[bytes, Tuple[int, int, int]] | None] = Queue()
 
         _host, _port, _timeout = self.host, self.port, self.timeout
 
@@ -292,9 +286,7 @@ class WyomingPiperClient:
                                 else:
                                     q.put((chunk.audio, None))
 
-                            elif event.type == "audio-stop":
-                                break
-                            elif event.type == "synthesize-stopped":
+                            elif event.type == "audio-stop" or event.type == "synthesize-stopped":
                                 break
                             elif event.type == "error":
                                 error_msg = event.data.get("text", "Unknown error")
@@ -303,7 +295,7 @@ class WyomingPiperClient:
                         await client.disconnect()
 
                 loop.run_until_complete(_run())
-            except Exception as e:
+            except (TimeoutError, WyomingError) as e:
                 q.put(e)
             finally:
                 q.put(None)
@@ -326,9 +318,9 @@ class WyomingPiperClient:
         """Check if the client is currently connected."""
         return self._client is not None
 
-    def __enter__(self) -> "WyomingPiperClient":
+    def __enter__(self) -> Self:
         self.connect()
         return self
 
-    def __exit__(self, *args: Any) -> None:
+    def __exit__(self, *args: object) -> None:
         self.disconnect()
