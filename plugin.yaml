@@ -24,7 +24,7 @@ config:
   mode:
     type: string
     default: "pipe"
-    description: "Synthesis mode: pipe (direct PCM→Opus, 1 conversion) or stream (streaming delivery)"
+    description: "Synthesis mode: pipe (single-pass conversion to the configured output_format) or stream (streaming delivery via TTSProvider.stream())"
   output_format:
     type: string
     default: "mp3"

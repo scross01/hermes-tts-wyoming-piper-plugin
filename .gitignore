@@ -2,3 +2,10 @@ __pycache__/
 *.pyc
 *.pyo
 .env
+.venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+benchmark_output/
+skills-lock.json
+uv.lock
