@@ -21,6 +21,7 @@ import os
 import shutil
 import subprocess
 import time
+import uuid
 import wave
 from typing import Any, Dict, Iterator, List
 
@@ -120,7 +121,7 @@ class WyomingPiperProvider(TTSProvider):
         format: str = "mp3",
         **extra: Any,
     ) -> str:
-        request_id = int(time.time() * 1000) % 100000
+        request_id = str(uuid.uuid4())
         _debug(
             f"[{request_id}] synthesize() mode={self._mode}: text={len(text)} chars, "
             f"voice={voice or self._voice or '(server default)'}, format={format}"
@@ -133,7 +134,7 @@ class WyomingPiperProvider(TTSProvider):
         return self._synthesize_pipe(request_id, text, output_path,
                                      voice=voice, format=format)
 
-    def _synthesize_pipe(self, request_id: int, text: str, output_path: str,
+    def _synthesize_pipe(self, request_id: str, text: str, output_path: str,
                          voice: str | None = None, format: str = "mp3") -> str:
         """Option 1: Pipe PCM directly to ffmpeg, skip WAV/MP3 intermediaries."""
         client = self._get_client()
@@ -167,7 +168,7 @@ class WyomingPiperProvider(TTSProvider):
         return self._pipe_pcm_to_format(request_id, wav_bytes, rate, width, channels,
                                          output_path, target_ext)
 
-    def _pipe_pcm_to_format(self, request_id: int, pcm_data: bytes,
+    def _pipe_pcm_to_format(self, request_id: str, pcm_data: bytes,
                             rate: int, width: int, channels: int,
                             output_path: str, target_ext: str) -> str:
         """Pipe raw PCM data through ffmpeg to target format.
@@ -225,7 +226,7 @@ class WyomingPiperProvider(TTSProvider):
         self._write_fallback_wav(pcm_data, rate, width, channels, wav_path)
         return wav_path
 
-    def _pipe_stream_to_format(self, request_id: int, pcm_iter: Iterator[bytes],
+    def _pipe_stream_to_format(self, request_id: str, pcm_iter: Iterator[bytes],
                                rate: int, width: int, channels: int,
                                output_path: str, target_ext: str) -> str:
         """Stream PCM chunks through ffmpeg to target format."""
@@ -313,7 +314,7 @@ class WyomingPiperProvider(TTSProvider):
 
     # --- Option 2: Streaming delivery ---
 
-    def _synthesize_stream_to_file(self, request_id: int, text: str, output_path: str,
+    def _synthesize_stream_to_file(self, request_id: str, text: str, output_path: str,
                                    voice: str | None = None, format: str = "mp3") -> str:
         """Option 2: Stream PCM chunks through ffmpeg as they arrive."""
         client = self._get_client()
