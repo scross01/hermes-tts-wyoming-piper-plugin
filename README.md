@@ -93,6 +93,32 @@ Or use the `text_to_speech` tool — it routes through your Piper server automat
 - Network access to the Piper server
 - ffmpeg (for Opus/MP3 output)
 
+## Development & Testing
+
+This project uses [uv](https://docs.astral.sh/uv/) for environment management.
+
+```bash
+# Create a local venv with the project's Python version
+uv venv --python 3.12
+
+# Install runtime and dev dependencies
+uv sync --all-extras
+
+# Run unit tests (excludes integration tests by default)
+.venv/bin/pytest tests/ -v -m "not integration"
+
+# Run linter
+.venv/bin/ruff check __init__.py wyoming_client.py tests/
+```
+
+### Integration tests
+
+Integration tests require a running Wyoming Piper server and are skipped by default:
+
+```bash
+.venv/bin/pytest tests/test_integration.py -v
+```
+
 ## How It Works
 
 1. Plugin registers as a TTS provider named `wyoming-piper`
