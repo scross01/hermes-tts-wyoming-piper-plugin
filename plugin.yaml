@@ -1,5 +1,5 @@
 name: tts-wyoming-piper
-version: 0.2.1
+version: 0.3.0
 description: "TTS provider using Wyoming Protocol to connect to remote Piper services"
 author: scross01
 license: MIT
@@ -25,6 +25,14 @@ config:
     type: string
     default: "pipe"
     description: "Synthesis mode: pipe (direct PCM→Opus, 1 conversion) or stream (streaming delivery)"
+  output_format:
+    type: string
+    default: "mp3"
+    description: "Output audio format: mp3 (universal), ogg (voice bubbles), wav (lossless), flac (compressed lossless)"
+  voice_compatible:
+    type: boolean
+    default: false
+    description: "Declare output as already voice-bubble compatible (OGG/Opus). When false, Hermes handles platform-specific conversion."
   debug:
     type: boolean
     default: false

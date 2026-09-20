@@ -66,12 +66,15 @@ class WyomingPiperProvider(TTSProvider):
     _name = "wyoming-piper"
 
     def __init__(self, host: str = "localhost", port: int = 10200,
-                 voice: str = "", timeout: int = 10, mode: str = "pipe"):
+                 voice: str = "", timeout: int = 10, mode: str = "pipe",
+                 output_format: str = "mp3", voice_compatible: bool = False):
         self._host = host
         self._port = port
         self._voice = voice
         self._timeout = timeout
         self._mode = mode  # "pipe" or "stream"
+        self._output_format = output_format.lower().strip() or "mp3"
+        self._voice_compatible = voice_compatible
         self._client = None
         self._voices: List[Dict[str, Any]] | None = None
 
@@ -482,7 +485,7 @@ class WyomingPiperProvider(TTSProvider):
 
     @property
     def voice_compatible(self) -> bool:
-        return True
+        return self._voice_compatible
 
 
 def register(ctx) -> None:
@@ -494,7 +497,10 @@ def register(ctx) -> None:
         voice=ctx.get_config("voice", ""),
         timeout=ctx.get_config("timeout", 10),
         mode=ctx.get_config("mode", "pipe"),
+        output_format=ctx.get_config("output_format", "mp3"),
+        voice_compatible=bool(ctx.get_config("voice_compatible", False)),
     )
     ctx.register_tts_provider(provider)
     _debug(f"Plugin registered: host={provider._host} port={provider._port} "
-           f"voice={provider._voice} mode={provider._mode} debug={_debug_enabled}")
+           f"voice={provider._voice} mode={provider._mode} format={provider._output_format} "
+           f"voice_compatible={provider._voice_compatible} debug={_debug_enabled}")

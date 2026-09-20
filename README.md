@@ -22,9 +22,10 @@ Most people use Wyoming Piper through Home Assistant's voice pipeline. This plug
 - Connect to any Wyoming-compatible Piper server
 - 44 languages, 174+ pre-trained voices
 - Voice selection via config or per-request
-- Voice bubble support — Opus encoding via ffmpeg
+- Configurable output format — MP3 (default), OGG, WAV, or FLAC
 - Warm-up and connection reuse for fast repeated synthesis
 - Two synthesis modes: `pipe` (efficient) and `stream` (streaming delivery)
+- Benchmark script to profile format and mode performance on your hardware
 
 ## Installation
 
@@ -51,8 +52,19 @@ plugins:
         voice: en_US-lessac-medium
         timeout: 10
         mode: pipe
+        output_format: mp3
+        voice_compatible: false
         debug: false
 ```
+
+Or set individual values from the CLI:
+
+```bash
+hermes config set plugins.entries.tts-wyoming-piper.settings.voice "en_US-norman-medium"
+hermes config set plugins.entries.tts-wyoming-piper.settings.output_format "mp3"
+```
+
+> **Note:** After changing plugin settings, restart both the Hermes gateway and desktop app for changes to take effect.
 
 | Setting | Description | Default |
 |---------|-------------|---------|
@@ -61,21 +73,99 @@ plugins:
 | `voice` | Voice name (empty = server default) | `""` |
 | `timeout` | Connection timeout in seconds | `10` |
 | `mode` | Synthesis mode: `pipe` or `stream` | `pipe` |
-| `debug` | Enable verbose debug logging to `~/.hermes/logs/wyoming-piper-debug.log` | `false` |
+| `output_format` | Output format: `mp3`, `ogg`, `wav`, `flac` | `mp3` |
+| `voice_compatible` | Declare output as already voice-bubble compatible (skip Hermes conversion) | `false` |
+| `debug` | Enable verbose debug logging | `false` |
+
+### Output Format & Voice Compatibility
+
+Piper always synthesizes raw PCM audio. The plugin converts it to your chosen format using ffmpeg. The two settings that control this work together:
+
+**`output_format`** — What container the audio is written to:
+
+| Format | Use when | File size (6s audio) |
+|--------|----------|---------------------|
+| `mp3` | Default. Plays everywhere — TUI, desktop, web, Telegram as attachment | ~27 KB |
+| `ogg` | Voice bubbles on Telegram, Matrix, WhatsApp, Signal | ~39 KB |
+| `wav` | Lossless, no ffmpeg needed (largest) | ~288 KB |
+| `flac` | Lossless, compressed (good for archival) | ~163 KB |
+
+**`voice_compatible`** — Controls whether the plugin tells Hermes the output is voice-bubble ready:
+
+- **`false` (default)** — The plugin produces MP3 (or your chosen format). Hermes handles platform-specific conversion: when Telegram asks for a voice bubble, Hermes converts MP3 → OGG/Opus via ffmpeg automatically. When the TUI plays the file, it stays as MP3. This is the right default for most setups.
+
+- **`true`** — The plugin tells Hermes the output is already voice-bubble compatible. Use this when you set `output_format: ogg` and want the plugin to handle conversion, skipping Hermes's own conversion step. Set this when your primary delivery target is a voice-bubble platform (Telegram, Matrix, etc.).
+
+**Quick guide:**
+
+| Your client | Recommended config |
+|-------------|-------------------|
+| TUI / Desktop only | `output_format: mp3`, `voice_compatible: false` |
+| Telegram / Matrix only | `output_format: ogg`, `voice_compatible: true` |
+| Both TUI and Telegram | `output_format: mp3`, `voice_compatible: false` (Hermes converts when needed) |
 
 ### Synthesis Modes
 
 **`pipe` (default)** — Efficient single-pass conversion:
 ```
-Piper TCP → PCM → ffmpeg → Opus/MP3
+Piper TCP → PCM → ffmpeg → target format
 ```
-Writes PCM directly to ffmpeg stdin, outputs the target format in one pass. No intermediate WAV or MP3 files.
+Writes PCM directly to ffmpeg stdin, outputs the target format in one pass. No intermediate WAV or MP3 files. Best for reliability and speed.
 
 **`stream`** — Streaming delivery via `TTSProvider.stream()`:
 ```
 Piper TCP chunks → ffmpeg → Opus chunks (yielded incrementally)
 ```
 Implements `TTSProvider.stream()` yielding Opus chunks as they arrive. Currently no Hermes consumer dispatches to `TTSProvider.stream()` — CLI voice mode and the dashboard use `StreamingTTSProvider` (raw PCM), a separate interface (Hermes #47896). Has potential future value once Hermes adds generic `stream()` dispatch.
+
+Both modes support all output formats. Pipe mode is faster in practice (see benchmark results below).
+
+## Benchmarking
+
+The `scripts/benchmark.py` script profiles synthesis performance across formats and modes against your live Piper server. Use it to determine the best config for your hardware and network.
+
+```bash
+# Run with defaults (3 runs each, all formats, both modes)
+.venv/bin/python3 scripts/benchmark.py
+
+# Custom options
+.venv/bin/python3 scripts/benchmark.py \
+  --host piper.local \
+  --voice en_US-lessac-medium \
+  --runs 5 \
+  --formats mp3 ogg \
+  --modes pipe
+```
+
+Sample output from a Raspberry Pi server over LAN:
+
+```
+Mode     Format   Runs   Net(s) FFmpeg(s) Total(s)   PCM(KB)  Out(KB) Dur(s)  Speedup
+-------------------------------------------------------------------------------------
+pipe     mp3       3/3    1.092     0.064    1.155     287.5     26.5   6.68    1.00x
+pipe     ogg       3/3    1.092     0.094    1.186     287.5     39.2   6.68    0.97x
+pipe     wav       3/3    1.092     0.000    1.092     287.5    287.5   6.68    1.06x
+pipe     flac      3/3    1.092     0.035    1.126     287.5    162.6   6.68    1.03x
+stream   mp3       3/3    1.206     0.000    1.206     292.5     27.0   6.65    0.96x
+stream   ogg       3/3    1.442     0.000    1.442     299.2     40.7   6.93    0.80x
+stream   wav       3/3    1.292     0.000    1.292     297.2    297.2   6.85    0.89x
+stream   flac      3/3    1.321     0.000    1.321     294.7    164.1   6.86    0.87x
+```
+
+Key takeaways from typical benchmarks:
+
+- **Network dominates** — the Wyoming PCM round-trip is the bottleneck; ffmpeg conversion is a small fraction (35–94ms)
+- **Pipe is faster than stream** — stream has async queue overhead
+- **MP3 is smallest** — best for universal playback
+- **All formats produce identical audio quality** — only the container differs
+
+Results are saved to `benchmark_output/benchmark_results.json` for comparison across runs.
+
+Run `--help` for all options:
+
+```bash
+.venv/bin/python3 scripts/benchmark.py --help
+```
 
 ## Usage
 
@@ -91,7 +181,17 @@ Or use the `text_to_speech` tool — it routes through your Piper server automat
 
 - Python 3.12+
 - Network access to the Piper server
-- ffmpeg (for Opus/MP3 output)
+- ffmpeg (for MP3/OGG/FLAC output; WAV works without it)
+
+## How It Works
+
+1. Plugin registers as a TTS provider named `wyoming-piper`
+2. On synthesis request, connects to the Wyoming Piper server via TCP
+3. Sends `describe` event to discover available voices (used for default voice selection)
+4. Sends `synthesize` event with the text
+5. Receives `audio-start` → `audio-chunk` × N → `audio-stop` events (always raw PCM)
+6. In `pipe` mode: pipes PCM directly to ffmpeg for the configured output format
+7. In `stream` mode: yields encoded chunks as they arrive
 
 ## Development & Testing
 
@@ -119,16 +219,6 @@ Integration tests require a running Wyoming Piper server and are skipped by defa
 .venv/bin/pytest tests/test_integration.py -v
 ```
 
-## How It Works
-
-1. Plugin registers as a TTS provider named `wyoming-piper`
-2. On synthesis request, connects to the Wyoming Piper server via TCP
-3. Sends `describe` event to discover available voices (used for default voice selection)
-4. Sends `synthesize` event with the text
-5. Receives `audio-start` → `audio-chunk` × N → `audio-stop` events
-6. In `pipe` mode: pipes PCM directly to ffmpeg for target format
-7. In `stream` mode: yields Opus chunks as they arrive
-
 ## Troubleshooting
 
 **Enable debug logging:**
@@ -153,6 +243,9 @@ Logs are written to `~/.hermes/logs/wyoming-piper-debug.log`. Disable by removin
 
 **Desktop app not picking up changes:**
 - Quit and reopen the desktop app (plugins only load at startup)
+
+**Audio cut off or won't play in TUI:**
+- Ensure `output_format: mp3` and `voice_compatible: false` (the defaults). OGG files may not play correctly in terminal audio players.
 
 ## License
 

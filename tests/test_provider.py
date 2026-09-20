@@ -55,8 +55,12 @@ class TestWyomingPiperProvider:
             assert arg in cmd
         assert cmd[-1] == "/tmp/out"
 
-    def test_voice_compatible(self):
+    def test_voice_compatible_default_false(self):
         p = WyomingPiperProvider()
+        assert p.voice_compatible is False
+
+    def test_voice_compatible_opt_in(self):
+        p = WyomingPiperProvider(voice_compatible=True)
         assert p.voice_compatible is True
 
     def test_write_fallback_wav_roundtrip(self):
