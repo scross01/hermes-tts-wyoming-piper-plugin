@@ -168,6 +168,31 @@ class WyomingPiperProvider(TTSProvider):
         return self._pipe_pcm_to_format(request_id, wav_bytes, rate, width, channels,
                                          output_path, target_ext)
 
+    def _build_ffmpeg_cmd(self, ffmpeg: str, rate: int, channels: int,
+                          target_ext: str, out_path: str) -> List[str]:
+        """Build the ffmpeg command list for raw PCM input to target_ext.
+
+        - target_ext "ogg"/"opus" → libopus, 48k, vbr on
+        - target_ext "mp3" → libmp3lame
+        - target_ext "flac" → flac
+        - target_ext "wav"/"pcm" → no extra codec args (PCM WAV is default)
+        """
+        cmd = [
+            ffmpeg, "-y",
+            "-f", "s16le",
+            "-ar", str(rate),
+            "-ac", str(channels),
+            "-i", "pipe:0",
+        ]
+        if target_ext in ("ogg", "opus"):
+            cmd.extend(["-acodec", "libopus", "-b:a", "48k", "-vbr", "on"])
+        elif target_ext == "mp3":
+            cmd.extend(["-acodec", "libmp3lame"])
+        elif target_ext == "flac":
+            cmd.extend(["-acodec", "flac"])
+        cmd.append(out_path)
+        return cmd
+
     def _pipe_pcm_to_format(self, request_id: str, pcm_data: bytes,
                             rate: int, width: int, channels: int,
                             output_path: str, target_ext: str) -> str:
@@ -186,24 +211,7 @@ class WyomingPiperProvider(TTSProvider):
         out_path = output_path if output_path.endswith(f".{target_ext}") else \
                    output_path.rsplit(".", 1)[0] + f".{target_ext}"
 
-        # Build ffmpeg command for raw PCM input
-        cmd = [
-            ffmpeg, "-y",
-            "-f", "s16le",  # PCM 16-bit little-endian
-            "-ar", str(rate),
-            "-ac", str(channels),
-            "-i", "pipe:0",  # Read from stdin
-        ]
-
-        if target_ext == "ogg":
-            # Opus for voice bubbles
-            cmd.extend(["-acodec", "libopus", "-b:a", "48k", "-vbr", "on"])
-        elif target_ext == "mp3":
-            cmd.extend(["-acodec", "libmp3lame"])
-        elif target_ext == "flac":
-            cmd.extend(["-acodec", "flac"])
-
-        cmd.append(out_path)
+        cmd = self._build_ffmpeg_cmd(ffmpeg, rate, channels, target_ext, out_path)
 
         try:
             result = subprocess.run(
@@ -240,22 +248,7 @@ class WyomingPiperProvider(TTSProvider):
         out_path = output_path if output_path.endswith(f".{target_ext}") else \
                    output_path.rsplit(".", 1)[0] + f".{target_ext}"
 
-        cmd = [
-            ffmpeg, "-y",
-            "-f", "s16le",
-            "-ar", str(rate),
-            "-ac", str(channels),
-            "-i", "pipe:0",
-        ]
-
-        if target_ext == "ogg":
-            cmd.extend(["-acodec", "libopus", "-b:a", "48k", "-vbr", "on"])
-        elif target_ext == "mp3":
-            cmd.extend(["-acodec", "libmp3lame"])
-        elif target_ext == "flac":
-            cmd.extend(["-acodec", "flac"])
-
-        cmd.append(out_path)
+        cmd = self._build_ffmpeg_cmd(ffmpeg, rate, channels, target_ext, out_path)
 
         proc = None
         try:
@@ -395,18 +388,7 @@ class WyomingPiperProvider(TTSProvider):
                 "Install ffmpeg or use mode='pipe' with format='wav'."
             )
 
-        cmd = [
-            ffmpeg, "-y",
-            "-f", "s16le",
-            "-ar", str(rate),
-            "-ac", str(channels),
-            "-i", "pipe:0",
-            "-acodec", "libopus",
-            "-b:a", "48k",
-            "-vbr", "on",
-            "-application", "voip",
-            "pipe:1",
-        ]
+        cmd = self._build_ffmpeg_cmd(ffmpeg, rate, channels, "opus", "pipe:1")
 
         proc = subprocess.Popen(
             cmd,

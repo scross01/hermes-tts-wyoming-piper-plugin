@@ -37,6 +37,24 @@ class TestWyomingPiperProvider:
         p = WyomingPiperProvider()
         assert p._target_extension(fmt) == expected
 
+    @pytest.mark.parametrize("target_ext,expected_codec_args", [
+        ("ogg", ["-acodec", "libopus", "-b:a", "48k", "-vbr", "on"]),
+        ("opus", ["-acodec", "libopus", "-b:a", "48k", "-vbr", "on"]),
+        ("mp3", ["-acodec", "libmp3lame"]),
+        ("flac", ["-acodec", "flac"]),
+        ("wav", []),
+        ("pcm", []),
+    ])
+    def test_build_ffmpeg_cmd(self, target_ext, expected_codec_args):
+        p = WyomingPiperProvider()
+        cmd = p._build_ffmpeg_cmd("/usr/bin/ffmpeg", 22050, 1, target_ext, "/tmp/out")
+        assert cmd[0] == "/usr/bin/ffmpeg"
+        assert "-f" in cmd
+        assert "s16le" in cmd
+        for arg in expected_codec_args:
+            assert arg in cmd
+        assert cmd[-1] == "/tmp/out"
+
     def test_voice_compatible(self):
         p = WyomingPiperProvider()
         assert p.voice_compatible is True
