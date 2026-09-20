@@ -3,7 +3,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from wyoming_client import WyomingPiperClient, WyomingVoice
 
@@ -107,3 +107,26 @@ class TestWyomingPiperClientPure:
         with patch.object(client, "connect"):
             result = client.__enter__()
             assert result is client
+
+
+class TestSynthesizeRawPcm:
+    def test_synthesize_returns_raw_pcm_without_wav_header(self):
+        from wyoming.audio import AudioChunk
+        from wyoming.event import Event
+
+        client = WyomingPiperClient()
+        pcm = b"\x01\x02" * 16
+        mock_conn = MagicMock()
+        mock_conn.write_event = AsyncMock()
+        mock_conn.read_event = AsyncMock(side_effect=[
+            Event(type="audio-start", data={"rate": 22050, "width": 2, "channels": 1}),
+            AudioChunk(audio=pcm, rate=22050, width=2, channels=1).event(),
+            Event(type="audio-stop", data={}),
+        ])
+        client._client = mock_conn  # skips connect() entirely
+
+        result = client.synthesize("hello")
+
+        assert result == pcm
+        assert not result.startswith(b"RIFF")
+        assert client.audio_format == (22050, 2, 1)

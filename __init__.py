@@ -10,7 +10,7 @@ Config settings (plugins.entries.tts-wyoming-piper.settings):
   voice: en_US-lessac-medium  # Voice name
   timeout: 10                 # Connection timeout seconds
   mode: pipe                  # pipe (default) or stream
-    - pipe: PCM → ffmpeg → Opus directly (1 conversion)
+    - pipe: PCM → ffmpeg → target format in one pass
     - stream: streaming delivery via TTSProvider.stream()
 """
 
@@ -149,7 +149,7 @@ class WyomingPiperProvider(TTSProvider):
 
     def _synthesize_pipe(self, request_id: str, text: str, output_path: str,
                          voice: str | None = None, format: str = "mp3") -> str:
-        """Option 1: Pipe PCM directly to ffmpeg, skip WAV/MP3 intermediaries."""
+        """Pipe raw PCM from the client through ffmpeg to the target format; wav/pcm written directly."""
         client = self._get_client()
         voice_name = voice or self.default_voice()
 
@@ -157,11 +157,11 @@ class WyomingPiperProvider(TTSProvider):
         target_ext = self._target_extension(format)
 
         t0 = time.monotonic()
-        wav_bytes = client.synthesize(text, voice=voice_name)
+        pcm_bytes = client.synthesize(text, voice=voice_name)
         elapsed = time.monotonic() - t0
 
         _debug(
-            f"[{request_id}] received {len(wav_bytes)} bytes in {elapsed:.2f}s, "
+            f"[{request_id}] received {len(pcm_bytes)} bytes in {elapsed:.2f}s, "
             f"voice={voice_name}"
         )
 
@@ -172,13 +172,16 @@ class WyomingPiperProvider(TTSProvider):
         # If target is wav or pcm, write directly
         if target_ext in ("wav", "pcm"):
             wav_path = output_path if output_path.endswith(".wav") else output_path.rsplit(".", 1)[0] + ".wav"
-            with open(wav_path, "wb") as f:
-                f.write(wav_bytes)
-            _debug(f"[{request_id}] wrote WAV: {wav_path}")
+            if target_ext == "pcm":
+                with open(wav_path, "wb") as f:
+                    f.write(pcm_bytes)
+            else:
+                self._write_wav(pcm_bytes, rate, width, channels, wav_path)
+            _debug(f"[{request_id}] wrote {target_ext}: {wav_path}")
             return wav_path
 
         # Pipe PCM → ffmpeg → target format
-        return self._pipe_pcm_to_format(request_id, wav_bytes, rate, width, channels,
+        return self._pipe_pcm_to_format(request_id, pcm_bytes, rate, width, channels,
                                          output_path, target_ext)
 
     def _build_ffmpeg_cmd(self, ffmpeg: str, rate: int, channels: int,
@@ -244,7 +247,7 @@ class WyomingPiperProvider(TTSProvider):
 
         # Fallback to WAV
         wav_path = output_path.rsplit(".", 1)[0] + ".wav"
-        self._write_fallback_wav(pcm_data, rate, width, channels, wav_path)
+        self._write_wav(pcm_data, rate, width, channels, wav_path)
         return wav_path
 
     def _pipe_stream_to_format(self, request_id: str, pcm_iter: Iterator[bytes],
@@ -294,11 +297,11 @@ class WyomingPiperProvider(TTSProvider):
                 proc.kill()
 
         wav_path = output_path.rsplit(".", 1)[0] + ".wav"
-        self._write_fallback_wav(b"".join(pcm_iter), rate, width, channels, wav_path)
+        self._write_wav(b"".join(pcm_iter), rate, width, channels, wav_path)
         _debug(f"[{request_id}] ffmpeg failed, wrote fallback WAV")
         return wav_path
 
-    def _write_fallback_wav(self, pcm_data: bytes, rate: int, width: int,
+    def _write_wav(self, pcm_data: bytes, rate: int, width: int,
                              channels: int, wav_path: str) -> None:
         """Write raw PCM data as a valid WAV file."""
         with open(wav_path, "wb") as f, wave.open(f, "wb") as wf:
@@ -347,9 +350,12 @@ class WyomingPiperProvider(TTSProvider):
 
         if target_ext in ("wav", "pcm"):
             wav_path = output_path if output_path.endswith(".wav") else output_path.rsplit(".", 1)[0] + ".wav"
-            raw_pcm = b"".join(pcm_iter())
-            with open(wav_path, "wb") as f:
-                f.write(raw_pcm)
+            if target_ext == "pcm":
+                raw_pcm = b"".join(pcm_iter())
+                with open(wav_path, "wb") as f:
+                    f.write(raw_pcm)
+            else:
+                self._write_wav(b"".join(pcm_iter()), rate, width, channels, wav_path)
             elapsed = time.monotonic() - t0
             _debug(
                 f"[{request_id}] streamed WAV: {wav_path} in {elapsed:.2f}s, voice={voice_name}"

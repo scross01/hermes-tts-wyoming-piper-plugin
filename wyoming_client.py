@@ -7,9 +7,7 @@ Uses the official wyoming package for protocol handling.
 from __future__ import annotations
 
 import asyncio
-import io
 import logging
-import wave
 from typing import Any, Dict, Iterator, List, Self, Tuple
 
 from wyoming.audio import AudioChunk
@@ -164,7 +162,7 @@ class WyomingPiperClient:
         text: str,
         voice: str | None = None,
     ) -> bytes:
-        """Synthesize text to WAV audio bytes."""
+        """Synthesize text to raw PCM audio bytes. Format (rate, width, channels) is available via the audio_format property."""
         self.connect()
         loop = self._get_loop()
 
@@ -206,16 +204,7 @@ class WyomingPiperClient:
 
             self._audio_format = (sample_rate, sample_width, channels)
 
-            raw_audio = b"".join(audio_chunks)
-
-            wav_buffer = io.BytesIO()
-            with wave.open(wav_buffer, "wb") as wf:
-                wf.setnchannels(channels)
-                wf.setsampwidth(sample_width)
-                wf.setframerate(sample_rate)
-                wf.writeframes(raw_audio)
-
-            return wav_buffer.getvalue()
+            return b"".join(audio_chunks)
 
         try:
             return loop.run_until_complete(_synthesize())

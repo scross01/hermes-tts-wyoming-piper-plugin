@@ -63,13 +63,13 @@ class TestWyomingPiperProvider:
         p = WyomingPiperProvider(voice_compatible=True)
         assert p.voice_compatible is True
 
-    def test_write_fallback_wav_roundtrip(self):
+    def test_write_wav_roundtrip(self):
         p = WyomingPiperProvider()
         pcm = b"\x00\x00" * 100  # 100 samples of silence
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             path = f.name
         try:
-            p._write_fallback_wav(pcm, 22050, 2, 1, path)
+            p._write_wav(pcm, 22050, 2, 1, path)
             with wave.open(path, "rb") as wf:
                 assert wf.getnchannels() == 1
                 assert wf.getsampwidth() == 2
@@ -144,6 +144,58 @@ class TestRequestId:
 
         first_call_arg = mock_debug.call_args[0][0]
         assert fixed_uuid in first_call_arg
+
+
+class TestPipeModeRawPcm:
+    @staticmethod
+    def _provider_with_client(pcm, fmt=(22050, 2, 1)):
+        p = WyomingPiperProvider()
+        mock_client = MagicMock()
+        mock_client.synthesize.return_value = pcm
+        mock_client.audio_format = fmt
+        p._client = mock_client
+        return p
+
+    def test_pipe_mp3_feeds_raw_pcm_to_ffmpeg(self, tmp_path):
+        p = self._provider_with_client(b"RAWPCM")
+        with patch("shutil.which", return_value="/usr/bin/ffmpeg"), \
+             patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            out = p._synthesize_pipe("req1", "hello", str(tmp_path / "out.mp3"),
+                                     voice="v", format="mp3")
+        assert out == str(tmp_path / "out.mp3")
+        assert mock_run.call_args.kwargs["input"] == b"RAWPCM"  # regression: was WAV-with-header
+
+    def test_pipe_wav_wraps_pcm_in_wav_header(self, tmp_path):
+        p = self._provider_with_client(b"\x00\x00" * 50)
+        out = p._synthesize_pipe("req1", "hello", str(tmp_path / "out.wav"),
+                                 voice="v", format="wav")
+        with wave.open(out, "rb") as wf:
+            assert wf.getframerate() == 22050
+            assert wf.readframes(wf.getnframes()) == b"\x00\x00" * 50
+
+    def test_pipe_pcm_request_produces_valid_single_wrap_wav(self, tmp_path):
+        # format="pcm" maps to target_ext "wav" (see _target_extension), so the
+        # output is a valid single-wrap WAV, not raw bytes.
+        p = self._provider_with_client(b"\x00\x00" * 50)
+        out = p._synthesize_pipe("req1", "hello", str(tmp_path / "out.wav"),
+                                 voice="v", format="pcm")
+        with wave.open(out, "rb") as wf:
+            assert wf.getframerate() == 22050
+            assert wf.readframes(wf.getnframes()) == b"\x00\x00" * 50
+
+    def test_stream_wav_path_gets_wav_header(self, tmp_path):
+        p = WyomingPiperProvider()
+        mock_client = MagicMock()
+        mock_client.synthesize_stream.return_value = iter([
+            (b"\x00\x00" * 10, (22050, 2, 1)),
+            (b"\x00\x00" * 10, None),
+        ])
+        with patch.object(p, "_get_client", return_value=mock_client):
+            out = p._synthesize_stream_to_file("req1", "hello", str(tmp_path / "out.wav"),
+                                               voice="v", format="wav")
+        with wave.open(out, "rb") as wf:
+            assert wf.readframes(wf.getnframes()) == b"\x00\x00" * 20
 
 
 class TestStreamHangFix:
