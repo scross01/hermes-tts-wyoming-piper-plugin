@@ -27,7 +27,7 @@ from typing import Any, Dict, Iterator, List
 
 from agent.tts_provider import TTSProvider
 
-from wyoming_client import WyomingError
+from .wyoming_client import WyomingError
 
 logger = logging.getLogger("hermes-wyoming-piper")
 
@@ -73,7 +73,7 @@ class WyomingPiperProvider(TTSProvider):
         if self._client is not None:
             return self._client
 
-        from wyoming_client import WyomingPiperClient
+        from .wyoming_client import WyomingPiperClient
 
         self._client = WyomingPiperClient(
             host=self._host,
