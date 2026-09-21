@@ -167,6 +167,55 @@ Run `--help` for all options:
 .venv/bin/python3 scripts/benchmark.py --help
 ```
 
+## Results: wyoming-piper vs. the Piper CLI
+
+Direct benchmark answering "should I use this plugin, or just call the `piper` CLI?" Measured with `scripts/compare_local_vs_remote.py`: 3 consecutive batches of 5 runs each, zero errors across all runs. Environment: Apple Silicon M1 Mac with **both** instances on the same machine — the CLI via `uvx piper-tts`, the server via the `rhasspy/wyoming-piper` container (both arm64) — voice `en_US-lessac-medium`, server reached over localhost TCP. Raw data: `benchmark_output/compare_local_vs_remote/run{1,2,3}.txt`.
+
+Combined means across all 15 runs (`Total` = call-to-audio-ready wall time; `TTFB` = time to first audio; `RTF` = synthesis time ÷ audio duration, lower is faster):
+
+| Text | Path | TTFB (s) | Total (s) | Audio (s) | RTF | vs. warm CLI |
+|------|------|---------:|----------:|----------:|----:|-------------:|
+| short (44 ch) | piper CLI — cold spawn | 0.74 | 0.76 | 2.6 | 0.29 | — |
+| short (44 ch) | piper CLI — warm | 0.23 | 0.73 | 2.7 | 0.28 | 1.0× |
+| short (44 ch) | wyoming-piper — pipe → PCM | — | 0.11 | 2.7 | 0.04 | 7× |
+| short (44 ch) | wyoming-piper — pipe → MP3 | — | 0.15 | 2.7 | 0.06 | 5× |
+| short (44 ch) | wyoming-piper — stream | 0.10 | 0.10 | 2.7 | 0.04 | 7× |
+| medium (144 ch) | piper CLI — cold spawn | 0.75 | 0.94 | 7.7 | 0.12 | — |
+| medium (144 ch) | piper CLI — warm | 0.23 | 0.91 | 7.6 | 0.12 | 1.0× |
+| medium (144 ch) | wyoming-piper — pipe → PCM | — | 0.28 | 7.8 | 0.04 | 3.2× |
+| medium (144 ch) | wyoming-piper — pipe → MP3 | — | 0.35 | 7.8 | 0.04 | 2.6× |
+| medium (144 ch) | wyoming-piper — stream | 0.10 | 0.29 | 7.7 | 0.04 | 3.2× |
+| long (441 ch) | piper CLI — cold spawn | 0.74 | 1.48 | 23.5 | 0.06 | — |
+| long (441 ch) | piper CLI — warm | 0.23 | 1.45 | 23.7 | 0.06 | 1.0× |
+| long (441 ch) | wyoming-piper — pipe → PCM | — | 0.86 | 23.5 | 0.04 | 1.7× |
+| long (441 ch) | wyoming-piper — pipe → MP3 | — | 1.02 | 23.5 | 0.04 | 1.4× |
+| long (441 ch) | wyoming-piper — stream | 0.10 | 0.91 | 23.7 | 0.04 | 1.6× |
+
+### What the numbers show
+
+- **A daemonized server removes a ~0.5 s fixed cost.** Time to first audio: 0.74 s (CLI — spawns a process and loads the ~60 MB model every utterance) → 0.23 s (CLI kept warm) → 0.10 s (server). Loading the model once, forever, is worth roughly half a second per utterance.
+- **The win is biggest for short utterances — exactly what a voice assistant produces.** 3–7× faster end-to-end for replies of a few words, narrowing to ~1.6× for paragraph-length text as synthesis time starts to dominate the fixed cost. The server also *starts speaking* ~0.3–0.6 s sooner, which is what humans notice.
+- **Streaming is effectively free.** `stream` TTFB equals `pipe` total: the server emits first audio in ~0.1 s either way, which is what enables incremental/chatty `stream()` playback.
+- **MP3 conversion is cheap.** The plugin's real pipe path (PCM → ffmpeg → MP3) adds only 0.04–0.15 s over raw PCM.
+- **Reproducible.** Nearly identical numbers across 3 batches × 5 runs, zero errors.
+
+### Why (and when) wyoming-piper beats the plain CLI
+
+| | piper CLI (`-m model --output-raw`) | wyoming-piper server |
+|---|---|---|
+| Process lifecycle | one process + model load **per utterance** | one daemon, model resident |
+| Time to first audio | 0.23 s warm / 0.74 s cold | ~0.10 s |
+| Concurrent clients | N instances = N model loads | one instance serves many (Hermes, Home Assistant, scripts) |
+| Streaming | raw bytes only after synthesis starts, unframed | audio chunks in ~0.1 s, framed Wyoming events |
+| Formats | raw PCM only — you convert yourself | plugin runs ffmpeg → MP3/OGG/WAV/FLAC centrally |
+| Where it runs | wherever your script runs | anywhere with the model — Pi, NAS, another host; clients just need TCP |
+
+**Choose wyoming-piper when** you want low-latency assistant replies (its sweet spot: 3–7× faster), more than one client will talk to the same model, the model lives on another machine, or you want MP3/OGG output without wiring ffmpeg yourself.
+
+**The plain CLI is fine when** you're doing batch/offline synthesis (one long-lived process amortizes the fixed cost), you can't run a persistent service, or you need a simple one-shot script where a server is overkill.
+
+> Caveats: absolute numbers depend on the voice model, hardware, and piper/onnxruntime build. For a **remote** server, add network RTT to the server's TTFB (a few ms on LAN; usually still well under ~0.3 s total). Rerun `uv run scripts/compare_local_vs_remote.py` on your own hardware before making decisions.
+
 ## Usage
 
 Once configured, use TTS as normal:

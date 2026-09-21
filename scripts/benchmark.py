@@ -456,7 +456,7 @@ def main() -> None:
         description="Benchmark tts-wyoming-piper: compare formats and modes.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--host", default="raspberrypi08", help="Piper server hostname")
+    parser.add_argument("--host", default="127.0.0.1", help="Piper server hostname")
     parser.add_argument("--port", type=int, default=10200, help="Piper server port")
     parser.add_argument("--voice", default="en_US-lessac-medium", help="Voice name")
     parser.add_argument(
