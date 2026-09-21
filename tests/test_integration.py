@@ -32,3 +32,21 @@ class TestWyomingPiperClientIntegration:
         client = WyomingPiperClient(host="localhost", port=10200)
         with pytest.raises(Exception):  # noqa: B017
             client.connect()
+
+
+@pytest.mark.integration
+class TestStreamConnectionErrorsEndToEnd:
+    """Real-network variant of plan-009's connection-refused regression test.
+
+    Deselected by default (`-m "not integration"`); run explicitly with
+    `.venv/bin/pytest tests/ -m integration`. The DNS variant was dropped
+    entirely: `nonexistent.invalid` resolution is environment-dependent
+    (resolver hijacking) in ways that make even a marked test unreliable.
+    """
+
+    def test_connection_refused_raises_wyoming_error(self):
+        from wyoming_client import WyomingError
+
+        client = WyomingPiperClient(host="127.0.0.1", port=1, timeout=2.0)
+        with pytest.raises(WyomingError):
+            list(client.synthesize_stream("hello"))

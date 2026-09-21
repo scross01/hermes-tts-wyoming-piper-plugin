@@ -143,14 +143,31 @@ class TestSynthesizeRawPcm:
 
 class TestSynthesizeStreamErrors:
     def test_connection_refused_raises_wyoming_error(self):
-        """Regression: ConnectionRefusedError used to vanish (empty stream)."""
-        client = WyomingPiperClient(host="127.0.0.1", port=1, timeout=2.0)
-        with pytest.raises(WyomingError):
+        """Regression: ConnectionRefusedError used to vanish (empty stream).
+
+        Hermetic: a real ConnectionRefusedError is simulated by making
+        AsyncTcpClient.connect raise one on the worker thread; the worker's
+        broad except must forward it and the consumer must re-raise it as
+        WyomingError. (The original version of this test used a real
+        localhost connection to a closed port; it was made hermetic for CI
+        stability - see plans/015.)"""
+        client = WyomingPiperClient()
+        mock_conn = MagicMock()
+        mock_conn.connect = AsyncMock(
+            side_effect=ConnectionRefusedError("[Errno 61] Connect call failed")
+        )
+        with patch("wyoming_client.AsyncTcpClient", return_value=mock_conn), \
+             pytest.raises(WyomingError):
             list(client.synthesize_stream("hello"))
 
-    def test_dns_failure_raises_wyoming_error(self):
-        client = WyomingPiperClient(host="nonexistent.invalid", port=10200, timeout=5.0)
-        with pytest.raises(WyomingError):
+    def test_unexpected_worker_exception_raises_wyoming_error(self):
+        """Any non-WyomingError exception on the worker thread must surface as
+        WyomingError in the consumer (the plan-009 contract), hermetically."""
+        client = WyomingPiperClient()
+        mock_conn = MagicMock()
+        mock_conn.connect = AsyncMock(side_effect=OSError("some socket failure"))
+        with patch("wyoming_client.AsyncTcpClient", return_value=mock_conn), \
+             pytest.raises(WyomingError):
             list(client.synthesize_stream("hello"))
 
     def test_midstream_error_event_raises_wyoming_server_error(self):
