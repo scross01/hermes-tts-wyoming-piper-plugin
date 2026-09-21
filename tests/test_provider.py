@@ -18,6 +18,20 @@ from tests.conftest import _load_wyoming_piper
 WyomingPiperProvider = _load_wyoming_piper().WyomingPiperProvider
 
 
+@pytest.fixture(autouse=True)
+def _no_real_ffmpeg(monkeypatch):
+    """Keep the unit suite hermetic: resolve ffmpeg via a fake binary path.
+
+    These tests mock subprocess.Popen/run themselves; what they must never do
+    is depend on ffmpeg being installed on the machine running the tests
+    (the plan-013 doctrine: CI has no ffmpeg). Tests that specifically cover
+    the not-found path patch shutil.which with None after this fixture runs,
+    and monkeypatch.setattr defers to per-test patches set inside the test
+    body, so those keep working.
+    """
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg" if name == "ffmpeg" else None)
+
+
 class TestWyomingPiperProvider:
     def test_name(self):
         p = WyomingPiperProvider()
