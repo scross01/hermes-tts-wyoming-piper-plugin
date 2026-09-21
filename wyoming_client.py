@@ -295,7 +295,19 @@ class WyomingPiperClient:
                                 error_msg = event.data.get("text", "Unknown error")
                                 raise WyomingServerError(f"Synthesis error: {error_msg}")
                     finally:
-                        await client.disconnect()
+                        try:
+                            await asyncio.wait_for(
+                                client.disconnect(), timeout=_timeout
+                            )
+                        except TimeoutError:
+                            logger.debug(
+                                "synthesize_stream: disconnect timed out after %ss",
+                                _timeout,
+                            )
+                        except Exception as te:  # noqa: BLE001 — teardown noise, logged not raised
+                            logger.debug(
+                                "synthesize_stream: disconnect failed: %s", te
+                            )
 
                 loop.run_until_complete(_run())
             # Forward everything to the consumer (re-raised as WyomingServerError

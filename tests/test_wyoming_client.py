@@ -193,6 +193,68 @@ class TestSynthesizeStreamErrors:
             assert first == (b"\x01\x02", (22050, 2, 1))
             gen.close()  # must return promptly, not hang
 
+    def test_disconnect_failure_does_not_mask_primary_error(self):
+        """CORRECTNESS-04: a failing disconnect must not replace the real
+        synthesis error."""
+        from wyoming.event import Event
+
+        client = WyomingPiperClient()
+        mock_conn = MagicMock()
+        mock_conn.connect = AsyncMock()
+        mock_conn.disconnect = AsyncMock(side_effect=OSError("teardown boom"))
+        mock_conn.write_event = AsyncMock()
+        mock_conn.read_event = AsyncMock(side_effect=[
+            Event(type="error", data={"text": "voice not found"}),
+        ])
+        with patch("wyoming_client.AsyncTcpClient", return_value=mock_conn), \
+             pytest.raises(WyomingServerError, match="Synthesis error: voice not found"):
+            list(client.synthesize_stream("hello"))
+
+    def test_disconnect_hang_does_not_hang_consumer(self):
+        """CORRECTNESS-04: a hanging disconnect must not stop the sentinel
+        from being posted; the consumer gets its data. Runs in ~timeout, not
+        the 10s the fake disconnect would take without the bound."""
+        from wyoming.audio import AudioChunk
+        from wyoming.event import Event
+
+        client = WyomingPiperClient(timeout=0.1)
+        mock_conn = MagicMock()
+        mock_conn.connect = AsyncMock()
+
+        async def hanging_disconnect():
+            await asyncio.sleep(10)
+
+        mock_conn.disconnect = hanging_disconnect
+        mock_conn.write_event = AsyncMock()
+        mock_conn.read_event = AsyncMock(side_effect=[
+            Event(type="audio-start", data={"rate": 22050, "width": 2, "channels": 1}),
+            AudioChunk(audio=b"\x01\x02", rate=22050, width=2, channels=1).event(),
+            Event(type="audio-stop", data={}),
+        ])
+        with patch("wyoming_client.AsyncTcpClient", return_value=mock_conn):
+            items = list(client.synthesize_stream("hello"))
+        assert items == [(b"\x01\x02", (22050, 2, 1))]
+
+    def test_disconnect_failure_alone_ends_stream_cleanly(self):
+        """If synthesis succeeded but teardown fails, the stream still ends
+        with its data intact (teardown error only logged)."""
+        from wyoming.audio import AudioChunk
+        from wyoming.event import Event
+
+        client = WyomingPiperClient()
+        mock_conn = MagicMock()
+        mock_conn.connect = AsyncMock()
+        mock_conn.disconnect = AsyncMock(side_effect=OSError("teardown boom"))
+        mock_conn.write_event = AsyncMock()
+        mock_conn.read_event = AsyncMock(side_effect=[
+            Event(type="audio-start", data={"rate": 22050, "width": 2, "channels": 1}),
+            AudioChunk(audio=b"\x01\x02", rate=22050, width=2, channels=1).event(),
+            Event(type="audio-stop", data={}),
+        ])
+        with patch("wyoming_client.AsyncTcpClient", return_value=mock_conn):
+            items = list(client.synthesize_stream("hello"))
+        assert items == [(b"\x01\x02", (22050, 2, 1))]
+
 
 class TestThreadSafety:
     def test_lock_is_reentrant(self):
