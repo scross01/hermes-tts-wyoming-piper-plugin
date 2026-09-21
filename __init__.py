@@ -485,10 +485,14 @@ class WyomingPiperProvider(TTSProvider):
 
             if proc.stdin:
                 proc.stdin.close()
+
             remaining = proc.stdout.read()
+            # ffmpeg has exited by the time the drain returns: record its
+            # status BEFORE suspending on the final yield, so a consumer that
+            # never resumes us still gets the failure surfaced in the finally.
+            completed = True
             if remaining:
                 yield remaining
-            completed = True
         finally:
             if proc.stdin:
                 proc.stdin.close()

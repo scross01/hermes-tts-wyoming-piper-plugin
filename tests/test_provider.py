@@ -346,6 +346,56 @@ class TestStreamFfmpegFailure:
             chunks = list(p.stream("hello"))
         assert chunks == [b"out1"]
 
+    def test_close_after_final_chunk_still_raises_on_ffmpeg_failure(self):
+        """CORRECTNESS-06: receiving the final chunk and then closing the
+        generator must still surface a failed encode (completed is recorded
+        before the final yield)."""
+        p = WyomingPiperProvider()
+        mock_client = MagicMock()
+        mock_client.synthesize_stream.return_value = iter([(b"in1", (22050, 2, 1))])
+        p._client = mock_client
+
+        mock_proc = MagicMock()
+        mock_proc.stdin = MagicMock()
+        mock_proc.stdout = MagicMock()
+        mock_proc.stdout.read.side_effect = [b"final-out"]  # only the drain
+        mock_proc.wait = MagicMock()
+        mock_proc.returncode = 1
+
+        def fake_popen(cmd, **kwargs):
+            kwargs["stderr"].write(b"encode died at the end")
+            kwargs["stderr"].seek(0)
+            return mock_proc
+
+        with patch("subprocess.Popen", side_effect=fake_popen):
+            gen = p.stream("hello")
+            chunks = []
+            for chunk in gen:            # consumes drain, yields final chunk,
+                chunks.append(chunk)     # then suspends before completed...
+                break
+            assert chunks == [b"final-out"]
+            with pytest.raises(RuntimeError, match="rc=1"):
+                gen.close()              # finally must now raise rc=1
+
+    def test_close_after_final_chunk_with_zero_rc_is_silent(self):
+        """Guard: the happy path with an early close stays silent."""
+        p = WyomingPiperProvider()
+        mock_client = MagicMock()
+        mock_client.synthesize_stream.return_value = iter([(b"in1", (22050, 2, 1))])
+        p._client = mock_client
+
+        mock_proc = MagicMock()
+        mock_proc.stdin = MagicMock()
+        mock_proc.stdout = MagicMock()
+        mock_proc.stdout.read.side_effect = [b"final-out"]
+        mock_proc.wait = MagicMock()
+        mock_proc.returncode = 0
+
+        with patch("subprocess.Popen", return_value=mock_proc):
+            gen = p.stream("hello")
+            next(gen)
+            gen.close()  # must not raise
+
     def test_stream_to_file_empty_stream_raises(self):
         p = WyomingPiperProvider()
         mock_client = MagicMock()
