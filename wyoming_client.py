@@ -240,7 +240,7 @@ class WyomingPiperClient:
         and server errors alike — are re-raised in the consuming thread as
         WyomingServerError.
         """
-        from queue import Queue
+        from queue import Empty, Queue
         from threading import Thread
 
         q: Queue[Tuple[bytes, Tuple[int, int, int]] | Exception | None] = Queue()
@@ -309,15 +309,27 @@ class WyomingPiperClient:
         thread = Thread(target=_consume_on_new_loop, daemon=True)
         thread.start()
 
-        while True:
-            item = q.get()
-            if item is None:
-                break
-            if isinstance(item, Exception):
-                if isinstance(item, WyomingServerError):
-                    raise item
-                raise WyomingServerError(f"Synthesis failed: {item}") from item
-            yield item
+        try:
+            while True:
+                item = q.get()
+                if item is None:
+                    break
+                if isinstance(item, Exception):
+                    if isinstance(item, WyomingServerError):
+                        raise item
+                    raise WyomingServerError(f"Synthesis failed: {item}") from item
+                yield item
+        finally:
+            # Consumer gone (close()/GeneratorExit/exception): drain whatever
+            # is already queued so the daemon worker is not blocked on put(),
+            # then let its finally (client.disconnect, loop.close, sentinel)
+            # run to completion. The worker remains a daemon thread; a full
+            # cancellation protocol is documented as a follow-up.
+            while not q.empty():
+                try:
+                    q.get_nowait()
+                except Empty:
+                    break
 
     def is_connected(self) -> bool:
         """Check if the client is currently connected."""

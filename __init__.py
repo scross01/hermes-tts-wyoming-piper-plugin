@@ -305,16 +305,14 @@ class WyomingPiperProvider(TTSProvider):
             if result == 0:
                 _debug(f"[{request_id}] piped PCM → {target_ext}: {out_path}")
                 return out_path
-            else:
-                stderr_bytes = proc.stderr.read() if proc.stderr else b""
-                stderr_text = stderr_bytes.decode("utf-8", errors="replace")[:200]
-                _debug(f"[{request_id}] ffmpeg error: {stderr_text}")
+            stderr_bytes = proc.stderr.read() if proc.stderr else b""
+            stderr_text = stderr_bytes.decode("utf-8", errors="replace")[:200]
+            _debug(f"[{request_id}] ffmpeg error: {stderr_text}")
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
             _debug(f"[{request_id}] ffmpeg failed: {e}")
+        finally:
             if proc is not None:
-                if proc.stdin:
-                    proc.stdin.close()
-                proc.kill()
+                self._shutdown_process(proc)
 
         wav_path = output_path.rsplit(".", 1)[0] + ".wav"
         self._write_wav(b"".join(consumed), rate, width, channels, wav_path)
@@ -330,6 +328,26 @@ class WyomingPiperProvider(TTSProvider):
             wf.setsampwidth(width)
             wf.setframerate(rate)
             wf.writeframes(pcm_data)
+
+    def _shutdown_process(self, proc: subprocess.Popen) -> None:
+        """Close stdin and reap the process with a bounded wait on every exit path.
+
+        Never raises: cleanup must not mask an in-flight exception.
+        """
+        try:
+            if proc.stdin is not None:
+                proc.stdin.close()
+            try:
+                proc.wait(timeout=_FFMPEG_SHUTDOWN_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                _debug("ffmpeg did not exit within timeout, killing")
+                proc.kill()
+                try:
+                    proc.wait(timeout=_FFMPEG_SHUTDOWN_TIMEOUT)
+                except (subprocess.TimeoutExpired, OSError):
+                    _debug("ffmpeg still alive after kill; giving up on wait()")
+        except OSError as e:
+            _debug(f"ffmpeg cleanup error: {e}")
 
     def _target_extension(self, format: str) -> str:
         """Determine target file extension from format hint."""
@@ -443,26 +461,38 @@ class WyomingPiperProvider(TTSProvider):
         )
 
         if proc.stdin is None or proc.stdout is None:
-            if proc.stdin:
-                proc.stdin.close()
-            proc.terminate()
+            self._shutdown_process(proc)
             raise RuntimeError("ffmpeg failed to open pipes")
 
         # Use a writer thread to avoid pipe deadlock between stdin and stdout
-        from queue import Queue
+        from queue import Empty, Queue
         from threading import Thread
 
         write_queue: Queue[bytes | None] = Queue()
         _stdin = proc.stdin
 
+        _WRITER_POLL_SECONDS = 0.1
+        _WRITER_IDLE_LIMIT_SECONDS = 5.0
+
         def _writer():
-            while True:
-                data = write_queue.get()
-                if data is None:
+            try:
+                idle = 0.0
+                while True:
+                    try:
+                        data = write_queue.get(timeout=_WRITER_POLL_SECONDS)
+                    except Empty:
+                        idle += _WRITER_POLL_SECONDS
+                        if idle >= _WRITER_IDLE_LIMIT_SECONDS:
+                            return  # no producer feeding us; exit
+                        continue
+                    idle = 0.0
+                    if data is None:
+                        _stdin.flush()
+                        return
+                    _stdin.write(data)
                     _stdin.flush()
-                    break
-                _stdin.write(data)
-                _stdin.flush()
+            except (OSError, ValueError):
+                _debug("stream(): writer thread failed writing to ffmpeg")
 
         writer_thread = Thread(target=_writer, daemon=True)
         writer_thread.start()
@@ -494,14 +524,11 @@ class WyomingPiperProvider(TTSProvider):
             if remaining:
                 yield remaining
         finally:
-            if proc.stdin:
-                proc.stdin.close()
-            try:
-                proc.wait(timeout=_FFMPEG_SHUTDOWN_TIMEOUT)
-            except subprocess.TimeoutExpired:
-                _debug("stream(): ffmpeg did not exit within timeout, killing")
-                proc.kill()
-                proc.wait()
+            # Signal the writer if it is still running (abnormal exit path).
+            write_queue.put(None)
+            if writer_thread.is_alive():
+                writer_thread.join(timeout=5)
+            self._shutdown_process(proc)
             stderr_file.seek(0)
             stderr_text = stderr_file.read().decode("utf-8", errors="replace")[-500:]
             stderr_file.close()

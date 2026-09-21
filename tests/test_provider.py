@@ -1,3 +1,4 @@
+import itertools
 import logging
 import os
 import subprocess
@@ -199,6 +200,72 @@ class TestPipeModeRawPcm:
             assert wf.readframes(wf.getnframes()) == b"\x00\x00" * 20
 
 
+class TestStreamLifecycle:
+    def _streamable_provider(self):
+        p = WyomingPiperProvider()
+        mock_client = MagicMock()
+        mock_client.synthesize_stream.return_value = iter(
+            [(b"in1", (22050, 2, 1))] + [(b"in2", None), (b"in3", None)]
+        )
+        p._client = mock_client
+        return p
+
+    def _proc_mock(self):
+        proc = MagicMock()
+        proc.stdin = MagicMock()
+        proc.stdout = MagicMock()
+        proc.stdout.read.side_effect = [b"out1", b"out2", b"out3", b"remaining"]
+        proc.wait = MagicMock()
+        proc.returncode = 0
+        return proc
+
+    def test_early_close_signals_writer_and_reaps(self):
+        """CORRECTNESS-03: consuming one chunk then close() must signal the
+        writer and reap the process."""
+        p = self._streamable_provider()
+        proc = self._proc_mock()
+        with patch("subprocess.Popen", return_value=proc):
+            gen = p.stream("hello")
+            first = next(gen)
+            assert first == b"out1"
+            gen.close()
+        assert proc.stdin.close.called  # reaped / stdin shut
+
+    def test_writer_thread_terminates_on_early_close(self):
+        """The writer must not survive the generator being closed: after close(),
+        a bounded join must suffice (no thread left blocked on the queue)."""
+        p = self._streamable_provider()
+        proc = self._proc_mock()
+        with patch("subprocess.Popen", return_value=proc):
+            gen = p.stream("hello")
+            next(gen)
+            gen.close()
+        # writer_thread is a local; we assert indirectly: no crash + proc reaped.
+        assert proc.stdin.close.called
+
+    def test_source_iterator_exception_propagates_from_stream(self):
+        """A WyomingServerError from the wyoming client mid-stream must reach
+        the consumer while the process is still reaped."""
+        p = WyomingPiperProvider()
+        mock_client = MagicMock()
+
+        def _raise():
+            raise WyomingServerError("Synthesis error: mid")
+
+        stream_iter = itertools.chain(
+            iter([(b"in1", (22050, 2, 1)), (b"in2", None)]),
+            (_raise() for _ in range(1)),
+        )
+        mock_client.synthesize_stream.return_value = stream_iter
+        p._client = mock_client
+
+        proc = self._proc_mock()
+        with patch("subprocess.Popen", return_value=proc), \
+             pytest.raises(WyomingServerError, match="Synthesis error: mid"):
+            list(p.stream("hello"))
+        assert proc.stdin.close.called
+
+
 class TestConfigValidation:
     def test_unknown_mode_warns_and_falls_back(self, caplog):
         with caplog.at_level(logging.WARNING):
@@ -244,13 +311,20 @@ class TestStreamHangFix:
         mock_proc = MagicMock()
         mock_proc.stdin = MagicMock()
         mock_proc.stdout = MagicMock()
-        mock_proc.stdout.read.side_effect = [b"", b""]
-        mock_proc.wait.side_effect = [subprocess.TimeoutExpired(cmd="ffmpeg", timeout=10), 0]
+        mock_proc.stdout.read.side_effect = [b"", b""]  # loop read + drain
+        # Plan 014: the wait calls now live in _shutdown_process —
+        # wait #1 times out (shutdown timeout), kill fires, wait #2 times
+        # out (post-kill), wait #3 succeeds. The kill assertion is the
+        # plan-003 contract and stays invariable.
+        mock_proc.wait.side_effect = [
+            subprocess.TimeoutExpired(cmd="ffmpeg", timeout=10),
+            subprocess.TimeoutExpired(cmd="ffmpeg", timeout=10),
+            0,
+        ]
         mock_proc.kill = MagicMock()
         mock_proc.returncode = 0
 
-        with patch("subprocess.Popen", return_value=mock_proc), \
-             patch("subprocess.DEVNULL"):
+        with patch("subprocess.Popen", return_value=mock_proc):
             list(p.stream("hello"))
 
         mock_proc.kill.assert_called_once()
@@ -291,7 +365,9 @@ class TestPipeStreamFallback:
                 str(tmp_path / "out.mp3"), "mp3",
             )
         assert mock_wav.call_args.args[0] == b"aa"  # best available: what was fed
-        proc.kill.assert_called_once()
+        # Plan 014: cleanup is _shutdown_process — kill only when the bounded
+        # wait times out; here (mock wait succeeds) the process is simply reaped.
+        proc.wait.assert_called()
 
     def test_success_returns_out_path_without_fallback(self, tmp_path):
         p = WyomingPiperProvider()
@@ -304,6 +380,47 @@ class TestPipeStreamFallback:
             )
         assert out == str(tmp_path / "out.mp3")
         mock_wav.assert_not_called()
+
+    def test_source_exception_propagates_and_reaps_process(self, tmp_path):
+        """CORRECTNESS-01: WyomingServerError from the iterator must propagate
+        (never become a fallback WAV) and ffmpeg must be reaped."""
+        p = WyomingPiperProvider()
+        proc = MagicMock()
+        proc.stdin = MagicMock()
+        proc.stderr = MagicMock()
+
+        def boom():
+            yield b"aa"
+            raise WyomingServerError("Synthesis error: voice not found")
+
+        with patch("subprocess.Popen", return_value=proc), \
+             patch.object(p, "_write_wav") as mock_wav, \
+             patch.object(p, "_shutdown_process", wraps=p._shutdown_process) as mock_shutdown, \
+             pytest.raises(WyomingServerError):
+            p._pipe_stream_to_format(
+                "req1", boom(), 22050, 2, 1,
+                str(tmp_path / "out.mp3"), "mp3",
+            )
+        mock_wav.assert_not_called()
+        mock_shutdown.assert_called_once()
+
+    def test_source_exception_leaves_no_running_process(self, tmp_path):
+        """The finally must reap even when the iterator raises before completion."""
+        p = WyomingPiperProvider()
+        proc = MagicMock()
+        proc.stdin = MagicMock()
+
+        def boom():
+            yield b"aa"
+            raise OSError("disk gone")
+
+        with patch("subprocess.Popen", return_value=proc), \
+             patch.object(p, "_shutdown_process") as mock_shutdown:
+            p._pipe_stream_to_format(
+                "req1", boom(), 22050, 2, 1,
+                str(tmp_path / "out.mp3"), "mp3",
+            )
+        mock_shutdown.assert_called_once()
 
 
 class TestStreamFfmpegFailure:

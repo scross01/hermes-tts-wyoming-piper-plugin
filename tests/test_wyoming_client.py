@@ -168,6 +168,31 @@ class TestSynthesizeStreamErrors:
              pytest.raises(WyomingServerError, match="Synthesis error: voice not found"):
             list(client.synthesize_stream("hello"))
 
+    def test_generator_close_does_not_raise_and_bounded(self):
+        """Consumer-side finally: closing the generator early must not hang and
+        must not lose the sentinel path."""
+        from wyoming.audio import AudioChunk
+        from wyoming.event import Event
+
+        client = WyomingPiperClient()
+        mock_conn = MagicMock()
+        mock_conn.connect = AsyncMock()
+        mock_conn.disconnect = AsyncMock()
+        mock_conn.write_event = AsyncMock()
+        # Worker that would produce many chunks; we consume one and close.
+        chunk_events = [
+            Event(type="audio-start", data={"rate": 22050, "width": 2, "channels": 1}),
+            AudioChunk(audio=b"\x01\x02", rate=22050, width=2, channels=1).event(),
+            AudioChunk(audio=b"\x03\x04", rate=22050, width=2, channels=1).event(),
+            Event(type="audio-stop", data={}),
+        ]
+        mock_conn.read_event = AsyncMock(side_effect=chunk_events)
+        with patch("wyoming_client.AsyncTcpClient", return_value=mock_conn):
+            gen = client.synthesize_stream("hello")
+            first = next(gen)
+            assert first == (b"\x01\x02", (22050, 2, 1))
+            gen.close()  # must return promptly, not hang
+
 
 class TestThreadSafety:
     def test_lock_is_reentrant(self):
