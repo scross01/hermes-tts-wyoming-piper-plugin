@@ -301,6 +301,57 @@ class TestConfigValidation:
         assert "unknown" not in caplog.text
 
 
+class TestOutputFormatIsUsed:
+    @staticmethod
+    def _provider_with_client(configured_format):
+        p = WyomingPiperProvider(output_format=configured_format)
+        mock_client = MagicMock()
+        mock_client.synthesize.return_value = b"RAWPCM"
+        mock_client.audio_format = (22050, 2, 1)
+        p._client = mock_client
+        return p
+
+    def test_configured_format_used_when_caller_omits_format(self, tmp_path):
+        """CORRECTNESS-05: output_format=flac must produce flac when the
+        caller does not pass format explicitly."""
+        p = self._provider_with_client("flac")
+        with patch("shutil.which", return_value="/usr/bin/ffmpeg"), \
+             patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            out = p.synthesize("hello", str(tmp_path / "out.mp3"))
+        assert out == str(tmp_path / "out.flac")
+
+    def test_explicit_caller_format_still_wins(self, tmp_path):
+        p = self._provider_with_client("flac")
+        with patch("shutil.which", return_value="/usr/bin/ffmpeg"), \
+             patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            out = p.synthesize("hello", str(tmp_path / "out.mp3"), format="mp3")
+        assert out == str(tmp_path / "out.mp3")
+
+    def test_default_output_format_is_mp3(self, tmp_path):
+        p = self._provider_with_client("mp3")
+        with patch("shutil.which", return_value="/usr/bin/ffmpeg"), \
+             patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            out = p.synthesize("hello", str(tmp_path / "out.mp3"))
+        assert out == str(tmp_path / "out.mp3")
+
+    def test_stream_mode_uses_configured_format_when_omitted(self, tmp_path):
+        p = WyomingPiperProvider(mode="stream", output_format="wav")
+        mock_client = MagicMock()
+        mock_client.synthesize_stream.return_value = iter([
+            (b"\x00\x00" * 10, (22050, 2, 1)),
+            (b"\x00\x00" * 10, None),
+        ])
+        with patch.object(p, "_get_client", return_value=mock_client):
+            # synthesize() resolves the omitted format from output_format and
+            # dispatches to the stream-to-file path with format="wav".
+            out = p.synthesize("hello", str(tmp_path / "out.mp3"))
+        with wave.open(out, "rb") as wf:
+            assert wf.getframerate() == 22050
+
+
 class TestStreamHangFix:
     def test_stream_kills_ffmpeg_on_timeout(self):
         p = WyomingPiperProvider()

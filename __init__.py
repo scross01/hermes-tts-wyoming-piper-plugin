@@ -148,10 +148,12 @@ class WyomingPiperProvider(TTSProvider):
         voice: str | None = None,
         model: str | None = None,
         speed: float | None = None,
-        format: str = "mp3",
+        format: str | None = None,
         **extra: Any,
     ) -> str:
         request_id = str(uuid.uuid4())
+        if format is None:
+            format = self._output_format or "mp3"
         _debug(
             f"[{request_id}] synthesize() mode={self._mode}: text={len(text)} chars, "
             f"voice={voice or self._voice or '(server default)'}, format={format}"
