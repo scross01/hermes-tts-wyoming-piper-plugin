@@ -4,7 +4,7 @@ description: "TTS provider using Wyoming Protocol to connect to remote Piper ser
 author: scross01
 license: MIT
 
-config:
+config_schema:
   host:
     type: string
     default: "localhost"
