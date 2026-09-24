@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+from queue import Empty, Full, Queue
+from threading import Thread
 from typing import Any, Dict, Iterator, List, Self, Tuple
 
 from wyoming.audio import AudioChunk
@@ -17,6 +19,11 @@ from wyoming.event import Event
 from wyoming.tts import Synthesize, SynthesizeVoice
 
 logger = logging.getLogger("hermes-wyoming-piper")
+
+_SAFETY_MAX_QUEUED_CHUNKS = 8
+_SAFETY_MAX_PCM_BYTES = 256 * 1024 * 1024
+_SAFETY_MAX_SYNTHESIS_SECONDS = 300.0
+_STREAM_QUEUE_PUT_TIMEOUT_SECONDS = 0.1
 
 
 class WyomingError(Exception):
@@ -193,6 +200,16 @@ class WyomingPiperClient:
         """Last known audio format (rate, width, channels) from synthesis."""
         return self._audio_format
 
+    @staticmethod
+    def _account_pcm_bytes(received_bytes: int, chunk_size: int) -> int:
+        received_bytes += chunk_size
+        if received_bytes > _SAFETY_MAX_PCM_BYTES:
+            raise WyomingServerError(
+                f"Synthesis response exceeded PCM budget of "
+                f"{_SAFETY_MAX_PCM_BYTES} bytes"
+            )
+        return received_bytes
+
     def synthesize(
         self,
         text: str,
@@ -214,6 +231,7 @@ class WyomingPiperClient:
                 await client.write_event(synthesize.event())
 
                 audio_chunks: List[bytes] = []
+                received_bytes = 0
                 sample_rate = 22050
                 sample_width = 2
                 channels = 1
@@ -230,6 +248,9 @@ class WyomingPiperClient:
 
                     elif event.type == "audio-chunk":
                         chunk = AudioChunk.from_event(event)
+                        received_bytes = self._account_pcm_bytes(
+                            received_bytes, len(chunk.audio)
+                        )
                         audio_chunks.append(chunk.audio)
 
                     elif event.type == "audio-stop" or event.type == "synthesize-stopped":
@@ -243,8 +264,19 @@ class WyomingPiperClient:
 
                 return b"".join(audio_chunks)
 
+            async def _synthesize_with_deadline():
+                try:
+                    return await asyncio.wait_for(
+                        _synthesize(), timeout=_SAFETY_MAX_SYNTHESIS_SECONDS
+                    )
+                except TimeoutError as error:
+                    raise WyomingServerError(
+                        "Synthesis timed out after "
+                        f"{_SAFETY_MAX_SYNTHESIS_SECONDS:g} seconds"
+                    ) from error
+
             try:
-                return loop.run_until_complete(_synthesize())
+                return loop.run_until_complete(_synthesize_with_deadline())
             except Exception as e:
                 self._invalidate_client()
                 if isinstance(e, WyomingServerError):
@@ -268,12 +300,22 @@ class WyomingPiperClient:
         and server errors alike — are re-raised in the consuming thread as
         WyomingServerError.
         """
-        from queue import Empty, Queue
-        from threading import Thread
-
-        q: Queue[Tuple[bytes, Tuple[int, int, int]] | Exception | None] = Queue()
-
+        StreamItem = Tuple[bytes, Tuple[int, int, int]] | Exception | None
+        q: Queue[StreamItem] = Queue(maxsize=_SAFETY_MAX_QUEUED_CHUNKS)
+        cancelled = threading.Event()
         _host, _port, _timeout = self.host, self.port, self.timeout
+
+        def _put(item: StreamItem) -> bool:
+            while not cancelled.is_set():
+                try:
+                    q.put(
+                        item,
+                        timeout=_STREAM_QUEUE_PUT_TIMEOUT_SECONDS,
+                    )
+                except Full:
+                    continue
+                return not cancelled.is_set()
+            return False
 
         def _consume_on_new_loop():
             loop = asyncio.new_event_loop()
@@ -298,9 +340,12 @@ class WyomingPiperClient:
                         sample_width = 2
                         channels = 1
                         format_sent = False
+                        received_bytes = 0
 
-                        while True:
+                        while not cancelled.is_set():
                             event = await client.read_event()
+                            if cancelled.is_set():
+                                break
                             if event is None:
                                 raise WyomingServerError("Connection closed during synthesis")
 
@@ -310,12 +355,19 @@ class WyomingPiperClient:
                                 channels = event.data.get("channels", 1)
 
                             elif event.type == "audio-chunk":
+                                if cancelled.is_set():
+                                    break
                                 chunk = AudioChunk.from_event(event)
-                                if not format_sent:
-                                    q.put((chunk.audio, (sample_rate, sample_width, channels)))
-                                    format_sent = True
+                                received_bytes = self._account_pcm_bytes(
+                                    received_bytes, len(chunk.audio)
+                                )
+                                if format_sent:
+                                    item = (chunk.audio, None)
                                 else:
-                                    q.put((chunk.audio, None))
+                                    item = (chunk.audio, (sample_rate, sample_width, channels))
+                                if not _put(item):
+                                    return
+                                format_sent = True
 
                             elif event.type == "audio-stop" or event.type == "synthesize-stopped":
                                 break
@@ -323,27 +375,24 @@ class WyomingPiperClient:
                                 error_msg = event.data.get("text", "Unknown error")
                                 raise WyomingServerError(f"Synthesis error: {error_msg}")
                     finally:
-                        try:
-                            await asyncio.wait_for(
-                                client.disconnect(), timeout=_timeout
-                            )
-                        except TimeoutError:
-                            logger.debug(
-                                "synthesize_stream: disconnect timed out after %ss",
-                                _timeout,
-                            )
-                        except Exception as te:  # noqa: BLE001 — teardown noise, logged not raised
-                            logger.debug(
-                                "synthesize_stream: disconnect failed: %s", te
-                            )
+                        await self._close_client(client)
 
-                loop.run_until_complete(_run())
-            # Forward everything to the consumer (re-raised as WyomingServerError
-            # there); asyncio.CancelledError still escapes (BaseException).
+                async def _run_with_deadline():
+                    try:
+                        await asyncio.wait_for(
+                            _run(), timeout=_SAFETY_MAX_SYNTHESIS_SECONDS
+                        )
+                    except TimeoutError as error:
+                        raise WyomingServerError(
+                            "Synthesis timed out after "
+                            f"{_SAFETY_MAX_SYNTHESIS_SECONDS:g} seconds"
+                        ) from error
+
+                loop.run_until_complete(_run_with_deadline())
             except Exception as e:  # noqa: BLE001
-                q.put(e)
+                _put(e)
             finally:
-                q.put(None)
+                _put(None)
                 loop.close()
 
         thread = Thread(target=_consume_on_new_loop, daemon=True)
@@ -360,16 +409,15 @@ class WyomingPiperClient:
                     raise WyomingServerError(f"Synthesis failed: {item}") from item
                 yield item
         finally:
-            # Consumer gone (close()/GeneratorExit/exception): drain whatever
-            # is already queued so the daemon worker is not blocked on put(),
-            # then let its finally (client.disconnect, loop.close, sentinel)
-            # run to completion. The worker remains a daemon thread; a full
-            # cancellation protocol is documented as a follow-up.
-            while not q.empty():
+            cancelled.set()
+            while True:
                 try:
                     q.get_nowait()
                 except Empty:
                     break
+            thread.join(timeout=max(_timeout * 2, _STREAM_QUEUE_PUT_TIMEOUT_SECONDS))
+            if thread.is_alive():
+                logger.debug("synthesize_stream: worker did not stop before join timeout")
 
     def is_connected(self) -> bool:
         """Check if the client is currently connected."""
