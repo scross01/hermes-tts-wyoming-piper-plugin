@@ -6,7 +6,7 @@ import sys
 import tempfile
 import threading
 import wave
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -54,6 +54,11 @@ class TestWyomingPiperProvider:
         p = WyomingPiperProvider()
         assert p._target_extension(fmt) == expected
 
+    @pytest.mark.parametrize("width,expected_input_format", [
+        (1, "u8"),
+        (2, "s16le"),
+        (4, "s32le"),
+    ])
     @pytest.mark.parametrize("target_ext,expected_codec_args", [
         ("ogg", ["-acodec", "libopus", "-b:a", "48k", "-vbr", "on"]),
         ("opus", ["-acodec", "libopus", "-b:a", "48k", "-vbr", "on"]),
@@ -62,15 +67,32 @@ class TestWyomingPiperProvider:
         ("wav", []),
         ("pcm", []),
     ])
-    def test_build_ffmpeg_cmd(self, target_ext, expected_codec_args):
+    def test_build_ffmpeg_cmd(self, width, expected_input_format, target_ext,
+                              expected_codec_args):
         p = WyomingPiperProvider()
-        cmd = p._build_ffmpeg_cmd("/usr/bin/ffmpeg", 22050, 1, target_ext, "/tmp/out")
+        cmd = p._build_ffmpeg_cmd(
+            "/usr/bin/ffmpeg", 22050, width, 1, target_ext, "/tmp/out"
+        )
         assert cmd[0] == "/usr/bin/ffmpeg"
-        assert "-f" in cmd
-        assert "s16le" in cmd
+        assert cmd[cmd.index("-f") + 1] == expected_input_format
         for arg in expected_codec_args:
             assert arg in cmd
         assert cmd[-1] == "/tmp/out"
+
+    def test_build_ffmpeg_rejects_unsupported_width(self):
+        p = WyomingPiperProvider()
+        with pytest.raises(ValueError, match="Unsupported PCM sample width: 3 bytes"):
+            p._build_ffmpeg_cmd(
+                "/usr/bin/ffmpeg", 22050, 3, 1, "mp3", "/tmp/out"
+            )
+
+    def test_build_ffmpeg_cmd_adds_ogg_pipe_muxer(self):
+        p = WyomingPiperProvider()
+        cmd = p._build_ffmpeg_cmd(
+            "/usr/bin/ffmpeg", 22050, 2, 1, "opus", "pipe:1"
+        )
+        assert cmd.index("-f", cmd.index("pipe:0")) < cmd.index("pipe:1")
+        assert cmd[cmd.index("-f", cmd.index("pipe:0")) + 1] == "ogg"
 
     def test_voice_compatible_default_false(self):
         p = WyomingPiperProvider()
@@ -266,8 +288,11 @@ class TestStreamLifecycle:
         proc = MagicMock()
         proc.stdin = MagicMock()
         proc.stdout = MagicMock()
-        proc.stdout.read.side_effect = [b"out1", b"out2", b"out3", b"remaining"]
-        proc.wait = MagicMock()
+        proc.stdout.read1.side_effect = [
+            b"out1", b"out2", b"out3", b"", b""
+        ]
+        proc.wait = MagicMock(return_value=0)
+        proc.kill = MagicMock()
         proc.returncode = 0
         return proc
 
@@ -294,6 +319,117 @@ class TestStreamLifecycle:
             gen.close()
         # writer_thread is a local; we assert indirectly: no crash + proc reaped.
         assert proc.stdin.close.called
+
+    def test_stream_slow_source_waits_for_later_chunk(self):
+        p = WyomingPiperProvider()
+        source_paused = threading.Event()
+        release_source = threading.Event()
+        results = []
+        errors = []
+        workers = []
+        real_thread = threading.Thread
+
+        def source():
+            yield b"in1", (22050, 2, 1)
+            source_paused.set()
+            release_source.wait(timeout=1)
+            yield b"in2", None
+
+        mock_client = MagicMock()
+        mock_client.synthesize_stream.return_value = source()
+        p._client = mock_client
+        proc = self._proc_mock()
+
+        def make_thread(*args, **kwargs):
+            worker = real_thread(*args, **kwargs)
+            workers.append(worker)
+            return worker
+
+        def consume():
+            try:
+                results.extend(p.stream("hello"))
+            except Exception as error:  # noqa: BLE001
+                errors.append(error)
+
+        consumer = real_thread(target=consume)
+        with patch("subprocess.Popen", return_value=proc), \
+             patch("tts_wyoming_piper.Thread", side_effect=make_thread):
+            consumer.start()
+            try:
+                assert source_paused.wait(timeout=1)
+                writer = next(
+                    worker for worker in workers
+                    if worker.name == "ffmpeg-input-writer"
+                )
+                assert writer.is_alive()
+                release_source.set()
+                consumer.join(timeout=1)
+            finally:
+                release_source.set()
+                consumer.join(timeout=1)
+                for worker in workers:
+                    worker.join(timeout=1)
+
+        assert not consumer.is_alive()
+        assert errors == []
+        assert not writer.is_alive()
+        assert proc.stdin.write.call_args_list == [call(b"in1"), call(b"in2")]
+
+    def test_stream_close_joins_blocked_writer(self):
+        p = WyomingPiperProvider()
+        write_started = threading.Event()
+        release_write = threading.Event()
+        workers = []
+        real_thread = threading.Thread
+
+        def blocked_write(_chunk):
+            write_started.set()
+            release_write.wait(timeout=1)
+
+        mock_client = MagicMock()
+        mock_client.synthesize_stream.return_value = iter(
+            [(b"in1", (22050, 2, 1))]
+            + [(f"in{index}", None) for index in range(2, 12)]
+        )
+        p._client = mock_client
+        proc = self._proc_mock()
+        proc.stdin.write.side_effect = blocked_write
+
+        def make_thread(*args, **kwargs):
+            worker = real_thread(*args, **kwargs)
+            workers.append(worker)
+            return worker
+
+        errors = []
+        generator = p.stream("hello")
+
+        def close_stream():
+            try:
+                generator.close()
+            except Exception as error:  # noqa: BLE001
+                errors.append(error)
+            else:
+                errors.append(None)
+
+        with patch("subprocess.Popen", return_value=proc), \
+             patch("tts_wyoming_piper.Thread", side_effect=make_thread):
+            try:
+                assert next(generator) == b"out1"
+                assert write_started.wait(timeout=1)
+            finally:
+                closer = real_thread(target=close_stream)
+                closer.start()
+                release_write.set()
+                closer.join(timeout=1)
+                generator.close()
+                for worker in workers:
+                    worker.join(timeout=1)
+
+        assert not closer.is_alive()
+        assert errors == [None]
+        assert proc.stdin.close.called
+        assert proc.wait.called
+        assert all(not worker.is_alive() for worker in workers)
 
     def test_source_iterator_exception_propagates_from_stream(self):
         """A WyomingServerError from the wyoming client mid-stream must reach
@@ -414,7 +550,7 @@ class TestStreamHangFix:
         mock_proc = MagicMock()
         mock_proc.stdin = MagicMock()
         mock_proc.stdout = MagicMock()
-        mock_proc.stdout.read.side_effect = [b"", b""]  # loop read + drain
+        mock_proc.stdout.read1.side_effect = [b"", b""]
         # Plan 014: the wait calls now live in _shutdown_process —
         # wait #1 times out (shutdown timeout), kill fires, wait #2 times
         # out (post-kill), wait #3 succeeds. The kill assertion is the
@@ -427,10 +563,96 @@ class TestStreamHangFix:
         mock_proc.kill = MagicMock()
         mock_proc.returncode = 0
 
-        with patch("subprocess.Popen", return_value=mock_proc):
+        with patch("subprocess.Popen", return_value=mock_proc), \
+             pytest.raises(TimeoutError, match="ffmpeg process timed out"):
             list(p.stream("hello"))
 
         mock_proc.kill.assert_called_once()
+
+
+class TestStreamOutputReads:
+    def test_stream_uses_incremental_read1(self):
+        p = WyomingPiperProvider()
+        mock_client = MagicMock()
+        mock_client.synthesize_stream.return_value = iter([
+            (b"in1", (22050, 2, 1)),
+        ])
+        p._client = mock_client
+        proc = MagicMock()
+        proc.stdin = MagicMock()
+        proc.stdout = MagicMock()
+        proc.stdout.read1.side_effect = [b"out1", b""]
+        proc.wait.return_value = 0
+        proc.returncode = 0
+
+        with patch("subprocess.Popen", return_value=proc):
+            chunks = list(p.stream("hello"))
+
+        assert chunks == [b"out1"]
+        assert proc.stdout.read1.call_count == 2
+        proc.stdout.read.assert_not_called()
+
+    def test_stream_blocked_read_reaches_cleanup(self):
+        p = WyomingPiperProvider()
+        read_started = threading.Event()
+        release_read = threading.Event()
+        workers = []
+        real_thread = threading.Thread
+
+        def blocked_read(_size):
+            read_started.set()
+            release_read.wait(timeout=1)
+            return b""
+
+        mock_client = MagicMock()
+        mock_client.synthesize_stream.return_value = iter([
+            (b"in1", (22050, 2, 1)),
+        ])
+        p._client = mock_client
+        proc = MagicMock()
+        proc.stdin = MagicMock()
+        proc.stdout = MagicMock()
+        proc.stdout.read1.side_effect = blocked_read
+        proc.wait.side_effect = [
+            0,
+            subprocess.TimeoutExpired(cmd="ffmpeg", timeout=10),
+            0,
+        ]
+        proc.returncode = 0
+        errors = []
+
+        def make_thread(*args, **kwargs):
+            worker = real_thread(*args, **kwargs)
+            workers.append(worker)
+            return worker
+
+        def consume():
+            try:
+                list(p.stream("hello"))
+            except Exception as error:  # noqa: BLE001
+                errors.append(error)
+
+        consumer = real_thread(target=consume)
+        with patch("subprocess.Popen", return_value=proc), \
+             patch("tts_wyoming_piper.Thread", side_effect=make_thread), \
+             patch("tts_wyoming_piper._FFMPEG_STREAM_PROCESS_TIMEOUT", 0.05), \
+             patch("tts_wyoming_piper._FFMPEG_SHUTDOWN_TIMEOUT", 0.01):
+            consumer.start()
+            try:
+                assert read_started.wait(timeout=1)
+                consumer.join(timeout=0.5)
+            finally:
+                release_read.set()
+                consumer.join(timeout=1)
+                for worker in workers:
+                    worker.join(timeout=1)
+
+        assert not consumer.is_alive()
+        assert len(errors) == 1
+        assert isinstance(errors[0], TimeoutError)
+        assert "timed out" in str(errors[0])
+        proc.kill.assert_called_once()
+        assert all(not worker.is_alive() for worker in workers)
 
 
 class TestPipeStreamFallback:
@@ -484,6 +706,30 @@ class TestPipeStreamFallback:
         assert out == str(tmp_path / "out.mp3")
         mock_wav.assert_not_called()
 
+    def test_file_stream_does_not_use_stderr_pipe(self, tmp_path):
+        p = WyomingPiperProvider()
+        proc = self._mock_proc(returncode=0)
+        with patch("subprocess.Popen", return_value=proc) as popen:
+            p._pipe_stream_to_format(
+                "req1", iter([b"aa"]), 22050, 2, 1,
+                str(tmp_path / "out.mp3"), "mp3",
+            )
+        assert popen.call_args.kwargs["stderr"] != subprocess.PIPE
+        assert popen.call_args.kwargs["stdout"] == subprocess.DEVNULL
+
+    def test_writer_failure_is_visible_on_zero_returncode(self, tmp_path):
+        p = WyomingPiperProvider()
+        proc = self._mock_proc(returncode=0)
+        proc.stdin.write.side_effect = BrokenPipeError("dead")
+        with patch("subprocess.Popen", return_value=proc), \
+             patch.object(p, "_write_wav") as mock_wav, \
+             pytest.raises(RuntimeError, match="ffmpeg input writer failed"):
+            p._pipe_stream_to_format(
+                "req1", iter([b"aa"]), 22050, 2, 1,
+                str(tmp_path / "out.mp3"), "mp3",
+            )
+        mock_wav.assert_not_called()
+
     def test_source_exception_propagates_and_reaps_process(self, tmp_path):
         """CORRECTNESS-01: WyomingServerError from the iterator must propagate
         (never become a fallback WAV) and ffmpeg must be reaped."""
@@ -518,12 +764,52 @@ class TestPipeStreamFallback:
             raise OSError("disk gone")
 
         with patch("subprocess.Popen", return_value=proc), \
-             patch.object(p, "_shutdown_process") as mock_shutdown:
+             patch.object(p, "_shutdown_process") as mock_shutdown, \
+             pytest.raises(OSError, match="disk gone"):
             p._pipe_stream_to_format(
                 "req1", boom(), 22050, 2, 1,
                 str(tmp_path / "out.mp3"), "mp3",
             )
         mock_shutdown.assert_called_once()
+
+
+class TestProcessShutdown:
+    def test_shutdown_broken_stdin_close_still_waits_and_kills(self):
+        p = WyomingPiperProvider()
+        proc = MagicMock()
+        proc.stdin.close.side_effect = BrokenPipeError("closed")
+        proc.wait.side_effect = [
+            subprocess.TimeoutExpired(cmd="ffmpeg", timeout=10),
+            0,
+        ]
+
+        p._shutdown_process(proc)
+
+        assert proc.wait.call_count == 2
+        proc.kill.assert_called_once_with()
+
+    def test_shutdown_kill_error_still_attempts_final_wait(self):
+        p = WyomingPiperProvider()
+        proc = MagicMock()
+        proc.wait.side_effect = [
+            subprocess.TimeoutExpired(cmd="ffmpeg", timeout=10),
+            0,
+        ]
+        proc.kill.side_effect = OSError("already gone")
+
+        p._shutdown_process(proc)
+
+        assert proc.wait.call_count == 2
+
+    def test_shutdown_treats_polled_exit_as_reaped(self):
+        p = WyomingPiperProvider()
+        proc = MagicMock()
+        proc.wait.side_effect = OSError("wait failed")
+        proc.poll.return_value = 0
+
+        p._shutdown_process(proc)
+
+        proc.kill.assert_not_called()
 
 
 class TestStreamFfmpegFailure:
@@ -536,7 +822,7 @@ class TestStreamFfmpegFailure:
         mock_proc = MagicMock()
         mock_proc.stdin = MagicMock()
         mock_proc.stdout = MagicMock()
-        mock_proc.stdout.read.side_effect = [b"out1"]   # loop body never runs; read once for `remaining`
+        mock_proc.stdout.read1.side_effect = [b"out1", b""]
         mock_proc.wait = MagicMock()
         mock_proc.returncode = 1
 
@@ -558,7 +844,7 @@ class TestStreamFfmpegFailure:
         mock_proc = MagicMock()
         mock_proc.stdin = MagicMock()
         mock_proc.stdout = MagicMock()
-        mock_proc.stdout.read.side_effect = [b"out1"]
+        mock_proc.stdout.read1.side_effect = [b"out1", b""]
         mock_proc.wait = MagicMock()
         mock_proc.returncode = 0
 
@@ -578,7 +864,7 @@ class TestStreamFfmpegFailure:
         mock_proc = MagicMock()
         mock_proc.stdin = MagicMock()
         mock_proc.stdout = MagicMock()
-        mock_proc.stdout.read.side_effect = [b"final-out"]  # only the drain
+        mock_proc.stdout.read1.side_effect = [b"final-out", b""]
         mock_proc.wait = MagicMock()
         mock_proc.returncode = 1
 
@@ -607,7 +893,7 @@ class TestStreamFfmpegFailure:
         mock_proc = MagicMock()
         mock_proc.stdin = MagicMock()
         mock_proc.stdout = MagicMock()
-        mock_proc.stdout.read.side_effect = [b"final-out"]
+        mock_proc.stdout.read1.side_effect = [b"final-out", b""]
         mock_proc.wait = MagicMock()
         mock_proc.returncode = 0
 

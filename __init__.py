@@ -25,6 +25,8 @@ import threading
 import time
 import uuid
 import wave
+from queue import Empty, Full, Queue
+from threading import Event, Thread
 from typing import Any, Dict, Iterator, List
 
 from agent.tts_provider import TTSProvider
@@ -46,7 +48,11 @@ logger = logging.getLogger("hermes-wyoming-piper")
 # Debug file logging — gated by plugins.entries.tts-wyoming-piper.settings.debug
 _DEBUG_LOG = os.path.expanduser("~/.hermes/logs/wyoming-piper-debug.log")
 _debug_enabled = False
-_FFMPEG_SHUTDOWN_TIMEOUT = 10  # seconds
+_FFMPEG_SHUTDOWN_TIMEOUT = 10
+_FFMPEG_STREAM_PROCESS_TIMEOUT = 30
+_FFMPEG_STREAM_QUEUE_MAX_SIZE = 8
+_FFMPEG_STREAM_QUEUE_TIMEOUT = 0.1
+_FFMPEG_STREAM_READ_SIZE = 4096
 _VALID_MODES = ("pipe", "stream")
 _VALID_OUTPUT_FORMATS = ("mp3", "ogg", "opus", "wav", "flac", "pcm")
 
@@ -206,7 +212,63 @@ class WyomingPiperProvider(TTSProvider):
         return self._pipe_pcm_to_format(request_id, pcm_bytes, rate, width, channels,
                                          output_path, target_ext)
 
-    def _build_ffmpeg_cmd(self, ffmpeg: str, rate: int, channels: int,
+    @staticmethod
+    def _put_with_cancellation(
+        queue: Queue[Any], item: Any, cancelled: Event
+    ) -> bool:
+        while not cancelled.is_set():
+            try:
+                queue.put(item, timeout=_FFMPEG_STREAM_QUEUE_TIMEOUT)
+            except Full:
+                continue
+            return not cancelled.is_set()
+        return False
+
+    def _start_output_reader(
+        self, stdout: Any, cancelled: Event
+    ) -> tuple[Queue[bytes | Exception | None], Thread]:
+        """Read incrementally with read1, falling back to a size-bounded read."""
+        output_queue: Queue[bytes | Exception | None] = Queue(
+            maxsize=_FFMPEG_STREAM_QUEUE_MAX_SIZE
+        )
+        read = getattr(stdout, "read1", None)
+        if not callable(read):
+            read = stdout.read
+
+        def _read_output():
+            try:
+                while not cancelled.is_set():
+                    chunk = read(_FFMPEG_STREAM_READ_SIZE)
+                    if not chunk:
+                        break
+                    if not self._put_with_cancellation(output_queue, chunk, cancelled):
+                        return
+            except (OSError, ValueError) as error:
+                self._put_with_cancellation(output_queue, error, cancelled)
+            finally:
+                self._put_with_cancellation(output_queue, None, cancelled)
+
+        thread = Thread(
+            target=_read_output,
+            name="ffmpeg-output-reader",
+            daemon=True,
+        )
+        thread.start()
+        return output_queue, thread
+
+    @staticmethod
+    def _next_output(
+        output_queue: Queue[bytes | Exception | None], timeout: float
+    ) -> bytes | None:
+        try:
+            item = output_queue.get(timeout=timeout)
+        except Empty as error:
+            raise TimeoutError("ffmpeg output read timed out") from error
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    def _build_ffmpeg_cmd(self, ffmpeg: str, rate: int, width: int, channels: int,
                           target_ext: str, out_path: str) -> List[str]:
         """Build the ffmpeg command list for raw PCM input to target_ext.
 
@@ -215,9 +277,17 @@ class WyomingPiperProvider(TTSProvider):
         - target_ext "flac" → flac
         - target_ext "wav"/"pcm" → no extra codec args (PCM WAV is default)
         """
+        sample_formats = {1: "u8", 2: "s16le", 4: "s32le"}
+        try:
+            sample_format = sample_formats[width]
+        except KeyError as error:
+            raise ValueError(
+                f"Unsupported PCM sample width: {width} bytes"
+            ) from error
+
         cmd = [
             ffmpeg, "-y",
-            "-f", "s16le",
+            "-f", sample_format,
             "-ar", str(rate),
             "-ac", str(channels),
             "-i", "pipe:0",
@@ -228,6 +298,8 @@ class WyomingPiperProvider(TTSProvider):
             cmd.extend(["-acodec", "libmp3lame"])
         elif target_ext == "flac":
             cmd.extend(["-acodec", "flac"])
+        if out_path == "pipe:1" and target_ext in ("ogg", "opus"):
+            cmd.extend(["-f", "ogg"])
         cmd.append(out_path)
         return cmd
 
@@ -249,7 +321,9 @@ class WyomingPiperProvider(TTSProvider):
         out_path = output_path if output_path.endswith(f".{target_ext}") else \
                    output_path.rsplit(".", 1)[0] + f".{target_ext}"
 
-        cmd = self._build_ffmpeg_cmd(ffmpeg, rate, channels, target_ext, out_path)
+        cmd = self._build_ffmpeg_cmd(
+            ffmpeg, rate, width, channels, target_ext, out_path
+        )
 
         try:
             result = subprocess.run(
@@ -286,43 +360,100 @@ class WyomingPiperProvider(TTSProvider):
 
         out_path = output_path if output_path.endswith(f".{target_ext}") else \
                    output_path.rsplit(".", 1)[0] + f".{target_ext}"
-
-        cmd = self._build_ffmpeg_cmd(ffmpeg, rate, channels, target_ext, out_path)
+        cmd = self._build_ffmpeg_cmd(
+            ffmpeg, rate, width, channels, target_ext, out_path
+        )
 
         consumed: List[bytes] = []
+        source_errors: List[Exception] = []
+        writer_errors: List[Exception] = []
+        cancelled = Event()
         proc = None
+        writer_thread = None
+        stderr_file = None
+        result = None
+        pipe_error = None
+        stderr_text = ""
+
         try:
+            stderr_file = tempfile.TemporaryFile()  # noqa: SIM115
             proc = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=stderr_file,
             )
             if proc.stdin is None:
                 raise RuntimeError("ffmpeg failed to open stdin pipe")
 
-            for chunk in pcm_iter:
-                proc.stdin.write(chunk)
-                consumed.append(chunk)
-            proc.stdin.close()
+            def _write_source():
+                try:
+                    for chunk in pcm_iter:
+                        if cancelled.is_set():
+                            break
+                        try:
+                            proc.stdin.write(chunk)
+                        except (OSError, ValueError) as error:
+                            writer_errors.append(error)
+                            return
+                        consumed.append(chunk)
+                except Exception as error:  # noqa: BLE001
+                    source_errors.append(error)
+                finally:
+                    if not cancelled.is_set():
+                        try:
+                            proc.stdin.flush()
+                            proc.stdin.close()
+                        except (OSError, ValueError) as error:
+                            writer_errors.append(error)
 
-            result = proc.wait(timeout=30)
-            if result == 0:
-                _debug(f"[{request_id}] piped PCM → {target_ext}: {out_path}")
-                return out_path
-            stderr_bytes = proc.stderr.read() if proc.stderr else b""
-            stderr_text = stderr_bytes.decode("utf-8", errors="replace")[:200]
-            _debug(f"[{request_id}] ffmpeg error: {stderr_text}")
-        except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
-            _debug(f"[{request_id}] ffmpeg failed: {e}")
+            writer_thread = Thread(
+                target=_write_source,
+                name="ffmpeg-source-writer",
+                daemon=True,
+            )
+            writer_thread.start()
+            try:
+                result = proc.wait(timeout=_FFMPEG_STREAM_PROCESS_TIMEOUT)
+            except (subprocess.TimeoutExpired, OSError) as error:
+                pipe_error = error
+        except (FileNotFoundError, OSError) as error:
+            pipe_error = error
         finally:
+            cancelled.set()
             if proc is not None:
                 self._shutdown_process(proc)
+            if writer_thread is not None:
+                writer_thread.join(timeout=_FFMPEG_SHUTDOWN_TIMEOUT)
+                if writer_thread.is_alive():
+                    _debug("ffmpeg source writer did not stop before join timeout")
+            if stderr_file is not None:
+                try:
+                    stderr_file.seek(0)
+                    stderr_text = stderr_file.read().decode(
+                        "utf-8", errors="replace"
+                    )[-500:]
+                finally:
+                    stderr_file.close()
+
+        if source_errors:
+            raise source_errors[0]
+        if pipe_error is None and result == 0 and not writer_errors:
+            _debug(f"[{request_id}] piped PCM → {target_ext}: {out_path}")
+            return out_path
+        if pipe_error is None and result == 0 and writer_errors:
+            raise RuntimeError(
+                f"ffmpeg input writer failed: {writer_errors[0]}"
+            ) from writer_errors[0]
+
+        if pipe_error is not None:
+            _debug(f"[{request_id}] ffmpeg failed: {pipe_error}")
+        else:
+            _debug(f"[{request_id}] ffmpeg error: {stderr_text}")
 
         wav_path = output_path.rsplit(".", 1)[0] + ".wav"
         self._write_wav(b"".join(consumed), rate, width, channels, wav_path)
         logger.warning("ffmpeg failed; wrote fallback WAV: %s", wav_path)
-        _debug(f"[{request_id}] ffmpeg failed, wrote fallback WAV")
         return wav_path
 
     def _write_wav(self, pcm_data: bytes, rate: int, width: int,
@@ -335,24 +466,35 @@ class WyomingPiperProvider(TTSProvider):
             wf.writeframes(pcm_data)
 
     def _shutdown_process(self, proc: subprocess.Popen) -> None:
-        """Close stdin and reap the process with a bounded wait on every exit path.
-
-        Never raises: cleanup must not mask an in-flight exception.
-        """
+        """Close stdin and reap the process with bounded independent cleanup."""
         try:
             if proc.stdin is not None:
                 proc.stdin.close()
+        except (OSError, ValueError) as error:
+            _debug(f"ffmpeg stdin cleanup error: {error}")
+
+        try:
+            proc.wait(timeout=_FFMPEG_SHUTDOWN_TIMEOUT)
+            return
+        except subprocess.TimeoutExpired:
+            _debug("ffmpeg did not exit within timeout, killing")
+        except (OSError, ValueError) as error:
+            _debug(f"ffmpeg wait error: {error}")
             try:
-                proc.wait(timeout=_FFMPEG_SHUTDOWN_TIMEOUT)
-            except subprocess.TimeoutExpired:
-                _debug("ffmpeg did not exit within timeout, killing")
-                proc.kill()
-                try:
-                    proc.wait(timeout=_FFMPEG_SHUTDOWN_TIMEOUT)
-                except (subprocess.TimeoutExpired, OSError):
-                    _debug("ffmpeg still alive after kill; giving up on wait()")
-        except OSError as e:
-            _debug(f"ffmpeg cleanup error: {e}")
+                if proc.poll() is not None:
+                    return
+            except (OSError, ValueError):
+                pass
+
+        try:
+            proc.kill()
+        except (OSError, ValueError) as error:
+            _debug(f"ffmpeg kill error: {error}")
+
+        try:
+            proc.wait(timeout=_FFMPEG_SHUTDOWN_TIMEOUT)
+        except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+            _debug(f"ffmpeg final reap error: {error}")
 
     def _target_extension(self, format: str) -> str:
         """Determine target file extension from format hint."""
@@ -443,9 +585,9 @@ class WyomingPiperProvider(TTSProvider):
             return
 
         if fmt_info is not None:
-            rate, _, channels = fmt_info
+            rate, width, channels = fmt_info
         else:
-            rate, _, channels = 22050, 2, 1
+            rate, width, channels = 22050, 2, 1
 
         ffmpeg = shutil.which("ffmpeg")
         if not ffmpeg:
@@ -454,90 +596,180 @@ class WyomingPiperProvider(TTSProvider):
                 "Install ffmpeg or use mode='pipe' with format='wav'."
             )
 
-        cmd = self._build_ffmpeg_cmd(ffmpeg, rate, channels, "opus", "pipe:1")
-
-        # Temp file must outlive Popen and is read/closed in the finally below.
-        stderr_file = tempfile.TemporaryFile()  # noqa: SIM115
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=stderr_file,
+        cmd = self._build_ffmpeg_cmd(
+            ffmpeg, rate, width, channels, "opus", "pipe:1"
         )
 
-        if proc.stdin is None or proc.stdout is None:
-            self._shutdown_process(proc)
-            raise RuntimeError("ffmpeg failed to open pipes")
-
-        # Use a writer thread to avoid pipe deadlock between stdin and stdout
-        from queue import Empty, Queue
-        from threading import Thread
-
-        write_queue: Queue[bytes | None] = Queue()
-        _stdin = proc.stdin
-
-        _WRITER_POLL_SECONDS = 0.1
-        _WRITER_IDLE_LIMIT_SECONDS = 5.0
-
-        def _writer():
-            try:
-                idle = 0.0
-                while True:
-                    try:
-                        data = write_queue.get(timeout=_WRITER_POLL_SECONDS)
-                    except Empty:
-                        idle += _WRITER_POLL_SECONDS
-                        if idle >= _WRITER_IDLE_LIMIT_SECONDS:
-                            return  # no producer feeding us; exit
-                        continue
-                    idle = 0.0
-                    if data is None:
-                        _stdin.flush()
-                        return
-                    _stdin.write(data)
-                    _stdin.flush()
-            except (OSError, ValueError):
-                _debug("stream(): writer thread failed writing to ffmpeg")
-
-        writer_thread = Thread(target=_writer, daemon=True)
-        writer_thread.start()
-
+        stderr_file = tempfile.TemporaryFile()  # noqa: SIM115
+        proc = None
+        writer_thread = None
+        reader_thread = None
+        output_queue = None
+        writer_cancelled = Event()
+        reader_cancelled = Event()
+        writer_errors: List[Exception] = []
         completed = False
+        stderr_text = ""
+
         try:
-            write_queue.put(first_chunk)
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=stderr_file,
+            )
+            if proc.stdin is None or proc.stdout is None:
+                raise RuntimeError("ffmpeg failed to open pipes")
+
+            output_queue, reader_thread = self._start_output_reader(
+                proc.stdout, reader_cancelled
+            )
+            write_queue: Queue[bytes | None] = Queue(
+                maxsize=_FFMPEG_STREAM_QUEUE_MAX_SIZE
+            )
+
+            def _write_to_ffmpeg():
+                try:
+                    while not writer_cancelled.is_set():
+                        try:
+                            data = write_queue.get(
+                                timeout=_FFMPEG_STREAM_QUEUE_TIMEOUT
+                            )
+                        except Empty:
+                            continue
+                        if data is None:
+                            proc.stdin.flush()
+                            return
+                        proc.stdin.write(data)
+                        proc.stdin.flush()
+                        if writer_cancelled.is_set():
+                            return
+                except (OSError, ValueError) as error:
+                    writer_errors.append(error)
+                    try:
+                        proc.stdin.close()
+                    except (OSError, ValueError):
+                        pass
+
+            writer_thread = Thread(
+                target=_write_to_ffmpeg,
+                name="ffmpeg-input-writer",
+                daemon=True,
+            )
+            writer_thread.start()
+            reader_finished = False
+
+            def _drain_input_backpressure():
+                nonlocal reader_finished
+                if not write_queue.full():
+                    return
+                try:
+                    output = output_queue.get(timeout=_FFMPEG_STREAM_QUEUE_TIMEOUT)
+                except Empty:
+                    return
+                if isinstance(output, Exception):
+                    raise output
+                if output is None:
+                    reader_finished = True
+                else:
+                    yield output
+
+            if not self._put_with_cancellation(
+                write_queue, first_chunk, writer_cancelled
+            ):
+                return
 
             for pcm_bytes, fmt_info in stream_iter:
                 if fmt_info is not None:
                     _debug(f"stream: format={fmt_info}")
-                write_queue.put(pcm_bytes)
+                yield from _drain_input_backpressure()
+                if not self._put_with_cancellation(
+                    write_queue, pcm_bytes, writer_cancelled
+                ):
+                    return
+                if writer_errors:
+                    raise RuntimeError(
+                        f"ffmpeg input writer failed: {writer_errors[0]}"
+                    ) from writer_errors[0]
+                yield from _drain_input_backpressure()
 
-                opus_chunk = proc.stdout.read(4096)
-                if opus_chunk:
-                    yield opus_chunk
-
-            write_queue.put(None)
-            writer_thread.join(timeout=5)
-
-            if proc.stdin:
-                proc.stdin.close()
-
-            remaining = proc.stdout.read()
-            # ffmpeg has exited by the time the drain returns: record its
-            # status BEFORE suspending on the final yield, so a consumer that
-            # never resumes us still gets the failure surfaced in the finally.
-            completed = True
-            if remaining:
-                yield remaining
-        finally:
-            # Signal the writer if it is still running (abnormal exit path).
-            write_queue.put(None)
+            if not self._put_with_cancellation(
+                write_queue, None, writer_cancelled
+            ):
+                return
+            writer_thread.join(timeout=_FFMPEG_SHUTDOWN_TIMEOUT)
             if writer_thread.is_alive():
-                writer_thread.join(timeout=5)
-            self._shutdown_process(proc)
-            stderr_file.seek(0)
-            stderr_text = stderr_file.read().decode("utf-8", errors="replace")[-500:]
-            stderr_file.close()
-            if completed and proc.returncode != 0:
+                raise TimeoutError("ffmpeg input writer did not stop")
+            if writer_errors:
+                raise RuntimeError(
+                    f"ffmpeg input writer failed: {writer_errors[0]}"
+                ) from writer_errors[0]
+
+            try:
+                proc.stdin.close()
+            except (OSError, ValueError) as error:
+                raise RuntimeError(
+                    f"ffmpeg input close failed: {error}"
+                ) from error
+
+            try:
+                proc.wait(timeout=_FFMPEG_STREAM_PROCESS_TIMEOUT)
+            except subprocess.TimeoutExpired as error:
+                raise TimeoutError("ffmpeg process timed out") from error
+
+            final_chunk = None
+            drain_deadline = time.monotonic() + _FFMPEG_STREAM_PROCESS_TIMEOUT
+            while not reader_finished:
+                remaining = drain_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("ffmpeg output drain timed out")
+                output = self._next_output(output_queue, remaining)
+                if output is None:
+                    reader_finished = True
+                    break
+                if final_chunk is not None:
+                    completed = True
+                    yield final_chunk
+                final_chunk = output
+
+            completed = True
+            if final_chunk is not None:
+                yield final_chunk
+        finally:
+            writer_cancelled.set()
+            close_stream = getattr(stream_iter, "close", None)
+            if callable(close_stream):
+                try:
+                    close_stream()
+                except (OSError, RuntimeError, ValueError) as error:
+                    _debug(f"source iterator close error: {error}")
+            reader_cancelled.set()
+
+            if proc is not None:
+                self._shutdown_process(proc)
+            if proc is not None and proc.stdout is not None:
+                try:
+                    proc.stdout.close()
+                except (OSError, ValueError):
+                    pass
+            if writer_thread is not None:
+                writer_thread.join(timeout=_FFMPEG_SHUTDOWN_TIMEOUT)
+                if writer_thread.is_alive():
+                    _debug("ffmpeg input writer did not stop during cleanup")
+            if reader_thread is not None:
+                reader_thread.join(timeout=_FFMPEG_SHUTDOWN_TIMEOUT)
+                if reader_thread.is_alive():
+                    _debug("ffmpeg output reader did not stop during cleanup")
+
+            try:
+                stderr_file.seek(0)
+                stderr_text = stderr_file.read().decode(
+                    "utf-8", errors="replace"
+                )[-500:]
+            finally:
+                stderr_file.close()
+
+            if completed and proc is not None and proc.returncode not in (0, None):
                 raise RuntimeError(
                     f"ffmpeg stream encoding failed (rc={proc.returncode}): {stderr_text}"
                 )
