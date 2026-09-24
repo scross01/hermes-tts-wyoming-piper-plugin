@@ -1,5 +1,5 @@
 name: tts-wyoming-piper
-version: 0.3.0
+version: 0.4.0
 description: "TTS provider using Wyoming Protocol to connect to remote Piper services"
 author: scross01
 license: MIT
