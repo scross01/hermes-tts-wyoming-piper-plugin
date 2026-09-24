@@ -130,6 +130,16 @@ class WyomingPiperProvider(TTSProvider):
                 return pcm_bytes, audio_format
         raise WyomingServerError("Server returned no audio")
 
+    @staticmethod
+    def _close_source_iterator(stream_iter: Any) -> None:
+        close_stream = getattr(stream_iter, "close", None)
+        if not callable(close_stream):
+            return
+        try:
+            close_stream()
+        except (OSError, RuntimeError, ValueError, WyomingError) as error:
+            _debug(f"source iterator close error: {error}")
+
     def list_voices(self) -> List[Dict[str, Any]]:
         if self._voices is not None:
             return self._voices
@@ -224,11 +234,24 @@ class WyomingPiperProvider(TTSProvider):
 
     @staticmethod
     def _put_with_cancellation(
-        queue: Queue[Any], item: Any, cancelled: Event
+        queue: Queue[Any],
+        item: Any,
+        cancelled: Event,
+        timeout: float | None = None,
     ) -> bool:
+        wait_timeout = (
+            _FFMPEG_STREAM_PROCESS_TIMEOUT if timeout is None else timeout
+        )
+        deadline = time.monotonic() + wait_timeout
         while not cancelled.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
             try:
-                queue.put(item, timeout=_FFMPEG_STREAM_QUEUE_TIMEOUT)
+                queue.put(
+                    item,
+                    timeout=min(_FFMPEG_STREAM_QUEUE_TIMEOUT, remaining),
+                )
             except Full:
                 continue
             return not cancelled.is_set()
@@ -361,18 +384,22 @@ class WyomingPiperProvider(TTSProvider):
                                rate: int, width: int, channels: int,
                                output_path: str, target_ext: str) -> str:
         """Stream PCM chunks through ffmpeg to target format."""
-        ffmpeg = shutil.which("ffmpeg")
-        if not ffmpeg:
-            raise RuntimeError(
-                f"ffmpeg not found; cannot produce '{target_ext}' output. "
-                "Install ffmpeg or request format='wav'."
-            )
+        try:
+            ffmpeg = shutil.which("ffmpeg")
+            if not ffmpeg:
+                raise RuntimeError(
+                    f"ffmpeg not found; cannot produce '{target_ext}' output. "
+                    "Install ffmpeg or request format='wav'."
+                )
 
-        out_path = output_path if output_path.endswith(f".{target_ext}") else \
-                   output_path.rsplit(".", 1)[0] + f".{target_ext}"
-        cmd = self._build_ffmpeg_cmd(
-            ffmpeg, rate, width, channels, target_ext, out_path
-        )
+            out_path = output_path if output_path.endswith(f".{target_ext}") else \
+                       output_path.rsplit(".", 1)[0] + f".{target_ext}"
+            cmd = self._build_ffmpeg_cmd(
+                ffmpeg, rate, width, channels, target_ext, out_path
+            )
+        except (OSError, RuntimeError, ValueError, WyomingError):
+            self._close_source_iterator(pcm_iter)
+            raise
 
         consumed: List[bytes] = []
         source_errors: List[Exception] = []
@@ -431,6 +458,7 @@ class WyomingPiperProvider(TTSProvider):
             pipe_error = error
         finally:
             cancelled.set()
+            self._close_source_iterator(pcm_iter)
             if proc is not None:
                 self._shutdown_process(proc)
             if writer_thread is not None:
@@ -583,25 +611,33 @@ class WyomingPiperProvider(TTSProvider):
 
         # Read first chunk to determine actual audio format before starting ffmpeg
         stream_iter = client.synthesize_stream(text, voice=voice_name)
-        first_chunk, fmt_info = self._first_stream_audio(stream_iter)
+        try:
+            first_chunk, fmt_info = self._first_stream_audio(stream_iter)
 
-        if fmt_info is not None:
-            rate, width, channels = fmt_info
-        else:
-            rate, width, channels = 22050, 2, 1
+            if fmt_info is not None:
+                rate, width, channels = fmt_info
+            else:
+                rate, width, channels = 22050, 2, 1
 
-        ffmpeg = shutil.which("ffmpeg")
-        if not ffmpeg:
-            raise RuntimeError(
-                "ffmpeg not found; cannot produce 'opus' output. "
-                "Install ffmpeg or use mode='pipe' with format='wav'."
+            ffmpeg = shutil.which("ffmpeg")
+            if not ffmpeg:
+                raise RuntimeError(
+                    "ffmpeg not found; cannot produce 'opus' output. "
+                    "Install ffmpeg or use mode='pipe' with format='wav'."
+                )
+
+            cmd = self._build_ffmpeg_cmd(
+                ffmpeg, rate, width, channels, "opus", "pipe:1"
             )
+        except (OSError, RuntimeError, ValueError, WyomingError):
+            self._close_source_iterator(stream_iter)
+            raise
 
-        cmd = self._build_ffmpeg_cmd(
-            ffmpeg, rate, width, channels, "opus", "pipe:1"
-        )
-
-        stderr_file = tempfile.TemporaryFile()  # noqa: SIM115
+        try:
+            stderr_file = tempfile.TemporaryFile()  # noqa: SIM115
+        except (OSError, RuntimeError, ValueError):
+            self._close_source_iterator(stream_iter)
+            raise
         proc = None
         writer_thread = None
         reader_thread = None
@@ -678,7 +714,7 @@ class WyomingPiperProvider(TTSProvider):
             if not self._put_with_cancellation(
                 write_queue, first_chunk, writer_cancelled
             ):
-                return
+                raise TimeoutError("ffmpeg input queue timed out")
 
             for pcm_bytes, fmt_info in stream_iter:
                 if fmt_info is not None and fmt_info != (rate, width, channels):
@@ -687,7 +723,7 @@ class WyomingPiperProvider(TTSProvider):
                 if not self._put_with_cancellation(
                     write_queue, pcm_bytes, writer_cancelled
                 ):
-                    return
+                    raise TimeoutError("ffmpeg input queue timed out")
                 if writer_errors:
                     raise RuntimeError(
                         f"ffmpeg input writer failed: {writer_errors[0]}"
@@ -697,7 +733,7 @@ class WyomingPiperProvider(TTSProvider):
             if not self._put_with_cancellation(
                 write_queue, None, writer_cancelled
             ):
-                return
+                raise TimeoutError("ffmpeg input queue timed out")
             writer_thread.join(timeout=_FFMPEG_SHUTDOWN_TIMEOUT)
             if writer_thread.is_alive():
                 raise TimeoutError("ffmpeg input writer did not stop")
@@ -738,12 +774,7 @@ class WyomingPiperProvider(TTSProvider):
                 yield final_chunk
         finally:
             writer_cancelled.set()
-            close_stream = getattr(stream_iter, "close", None)
-            if callable(close_stream):
-                try:
-                    close_stream()
-                except (OSError, RuntimeError, ValueError) as error:
-                    _debug(f"source iterator close error: {error}")
+            self._close_source_iterator(stream_iter)
             reader_cancelled.set()
 
             if proc is not None:

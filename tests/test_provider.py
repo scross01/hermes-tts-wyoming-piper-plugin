@@ -431,6 +431,81 @@ class TestStreamLifecycle:
         assert not writer.is_alive()
         assert proc.stdin.write.call_args_list == [call(b"in1"), call(b"in2")]
 
+    def test_stream_full_input_queue_has_bounded_deadline(self):
+        p = self._streamable_provider()
+        p._client.synthesize_stream.return_value = iter(
+            [(b"in1", (22050, 2, 1))]
+            + [(f"in{index}", None) for index in range(2, 32)]
+        )
+        write_started = threading.Event()
+        release_write = threading.Event()
+        read_started = threading.Event()
+        release_read = threading.Event()
+        workers = []
+        real_thread = threading.Thread
+        write_count = 0
+        errors = []
+
+        def blocked_write(_chunk):
+            nonlocal write_count
+            write_count += 1
+            if write_count == 2:
+                write_started.set()
+                release_write.wait(timeout=1)
+
+        def blocked_read(_size):
+            read_started.set()
+            release_read.wait(timeout=1)
+            return b""
+
+        proc = self._proc_mock()
+        proc.stdin.write.side_effect = blocked_write
+        proc.stdout.read1.side_effect = blocked_read
+        proc.wait.side_effect = [
+            subprocess.TimeoutExpired(cmd="ffmpeg", timeout=10),
+            0,
+        ]
+        proc.kill.side_effect = lambda: (
+            release_write.set(),
+            release_read.set(),
+        )
+
+        def make_thread(*args, **kwargs):
+            worker = real_thread(*args, **kwargs)
+            workers.append(worker)
+            return worker
+
+        def consume():
+            try:
+                list(p.stream("hello"))
+            except Exception as error:  # noqa: BLE001
+                errors.append(error)
+
+        consumer = real_thread(target=consume)
+        with patch("subprocess.Popen", return_value=proc), \
+             patch("tts_wyoming_piper.Thread", side_effect=make_thread), \
+             patch("tts_wyoming_piper._FFMPEG_STREAM_PROCESS_TIMEOUT", 0.05), \
+             patch("tts_wyoming_piper._FFMPEG_SHUTDOWN_TIMEOUT", 0.05):
+            consumer.start()
+            try:
+                assert write_started.wait(timeout=1)
+                assert read_started.wait(timeout=1)
+                consumer.join(timeout=0.5)
+            finally:
+                release_write.set()
+                release_read.set()
+                consumer.join(timeout=1)
+                for worker in workers:
+                    worker.join(timeout=1)
+
+        assert not consumer.is_alive()
+        assert len(errors) == 1
+        assert isinstance(errors[0], TimeoutError)
+        assert "input queue timed out" in str(errors[0])
+        proc.kill.assert_called_once()
+        assert proc.wait.call_count == 2
+        assert all(not worker.is_alive() for worker in workers)
+
     def test_stream_close_joins_blocked_writer(self):
         p = WyomingPiperProvider()
         write_started = threading.Event()
@@ -802,6 +877,39 @@ class TestPipeStreamFallback:
         assert popen.call_args.kwargs["stderr"] != subprocess.PIPE
         assert popen.call_args.kwargs["stdout"] == subprocess.DEVNULL
 
+    def test_file_stream_closes_source_on_failure(self, tmp_path):
+        p = WyomingPiperProvider()
+        source_closed = threading.Event()
+        write_started = threading.Event()
+        release_write = threading.Event()
+
+        def source():
+            try:
+                yield b"aa"
+                yield b"bb"
+            finally:
+                source_closed.set()
+
+        def blocked_write(_chunk):
+            write_started.set()
+            release_write.wait(timeout=1)
+
+        proc = self._mock_proc(returncode=1)
+        proc.stdin.write.side_effect = blocked_write
+        proc.stdin.close.side_effect = release_write.set
+        with patch("subprocess.Popen", return_value=proc), \
+             patch.object(p, "_write_wav") as mock_wav:
+            out = p._pipe_stream_to_format(
+                "req1", source(), 22050, 2, 1,
+                str(tmp_path / "out.mp3"), "mp3",
+            )
+
+        assert write_started.wait(timeout=1)
+        assert source_closed.is_set()
+        assert out == str(tmp_path / "out.wav")
+        mock_wav.assert_called_once()
+        proc.wait.assert_called()
+
     def test_writer_failure_is_visible_on_zero_returncode(self, tmp_path):
         p = WyomingPiperProvider()
         proc = self._mock_proc(returncode=0)
@@ -1012,13 +1120,39 @@ class TestStreamFfmpegFailure:
              pytest.raises(RuntimeError, match="ffmpeg not found"):
             p._pipe_pcm_to_format(1, b"", 22050, 2, 1, "/tmp/out.mp3", "mp3")
 
-    def test_stream_raises_when_ffmpeg_missing(self):
+    def test_stream_closes_source_when_ffmpeg_missing(self):
         p = WyomingPiperProvider()
         mock_client = MagicMock()
-        mock_client.synthesize_stream.return_value = iter([
-            (b"\x00\x00", (22050, 2, 1)),
-        ])
+        source_closed = threading.Event()
+
+        def source():
+            try:
+                yield b"\x00\x00", (22050, 2, 1)
+                yield b"\x00\x00", None
+            finally:
+                source_closed.set()
+
+        mock_client.synthesize_stream.return_value = source()
         with patch.object(p, "_get_client", return_value=mock_client), \
              patch("shutil.which", return_value=None), \
              pytest.raises(RuntimeError, match="ffmpeg not found"):
             list(p.stream("hello"))
+        assert source_closed.is_set()
+
+    def test_stream_closes_source_when_command_build_fails(self):
+        p = WyomingPiperProvider()
+        mock_client = MagicMock()
+        source_closed = threading.Event()
+
+        def source():
+            try:
+                yield b"\x00\x00", (22050, 3, 1)
+            finally:
+                source_closed.set()
+
+        mock_client.synthesize_stream.return_value = source()
+        with patch.object(p, "_get_client", return_value=mock_client), \
+             patch("shutil.which", return_value="/usr/bin/ffmpeg"), \
+             pytest.raises(ValueError, match="Unsupported PCM sample width"):
+            list(p.stream("hello"))
+        assert source_closed.is_set()
