@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import wave
 from unittest.mock import MagicMock, patch
 
@@ -121,6 +122,43 @@ class TestWyomingPiperProvider:
         mock_client.describe.side_effect = WyomingError("connection failed")
         with patch.object(p, "_get_client", return_value=mock_client):
             assert p.list_voices() == []
+
+    def test_concurrent_client_init_constructs_one_client(self):
+        p = WyomingPiperProvider()
+        barrier = threading.Barrier(2)
+        result_lock = threading.Lock()
+        results = []
+        errors = []
+        constructed = []
+
+        def construct_client(**kwargs):
+            client = MagicMock(**kwargs)
+            with result_lock:
+                constructed.append(client)
+            return client
+
+        def get_client():
+            try:
+                barrier.wait(timeout=1)
+                client = p._get_client()
+                with result_lock:
+                    results.append(client)
+            except Exception as error:  # noqa: BLE001
+                with result_lock:
+                    errors.append(error)
+
+        threads = [threading.Thread(target=get_client) for _ in range(2)]
+        with patch("wyoming_client.WyomingPiperClient", side_effect=construct_client) as constructor:
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=1)
+
+        assert all(not thread.is_alive() for thread in threads)
+        assert errors == []
+        assert constructor.call_count == 1
+        assert len(constructed) == 1
+        assert results[0] is results[1]
 
     def test_synthesize_stream_to_file_pipes_incrementally(self):
         p = WyomingPiperProvider()

@@ -117,6 +117,76 @@ class TestWyomingPiperClientPure:
             result = client.__enter__()
             assert result is client
 
+    def test_handshake_error_disconnects_local_client(self):
+        from wyoming.event import Event
+
+        client = WyomingPiperClient(timeout=0.1)
+        mock_conn = MagicMock()
+        mock_conn.connect = AsyncMock()
+        mock_conn.disconnect = AsyncMock()
+        mock_conn.write_event = AsyncMock()
+        mock_conn.read_event = AsyncMock(
+            return_value=Event(type="error", data={"text": "describe failed"})
+        )
+
+        with patch("wyoming_client.AsyncTcpClient", return_value=mock_conn), \
+             pytest.raises(WyomingError, match="Expected 'info' event"):
+            client.connect()
+
+        mock_conn.disconnect.assert_awaited_once_with()
+        assert client.is_connected() is False
+
+    def test_disconnect_connection_reset_resets_state_and_closes_loop(self):
+        client = WyomingPiperClient(timeout=0.1)
+        mock_conn = MagicMock()
+        mock_conn.disconnect = AsyncMock(side_effect=ConnectionResetError("reset"))
+        client._client = mock_conn
+        client._info = {"tts": []}
+        client._voices = []
+        client._audio_format = (22050, 2, 1)
+        loop = client._get_loop()
+
+        client.disconnect()
+
+        assert client.is_connected() is False
+        assert client.audio_format is None
+        assert client._info is None
+        assert client._voices is None
+        assert client._loop is None
+        assert loop.is_closed()
+
+    def test_disconnect_releases_loop_before_next_connect(self):
+        from wyoming.event import Event
+
+        client = WyomingPiperClient(timeout=0.1)
+        released = MagicMock()
+        released.disconnect = AsyncMock()
+        client._client = released
+        released_loop = client._get_loop()
+
+        client.disconnect()
+
+        assert released.disconnect.await_count == 1
+        assert released_loop.is_closed()
+        assert client._loop is None
+
+        replacement = MagicMock()
+        replacement.connect = AsyncMock()
+        replacement.disconnect = AsyncMock()
+        replacement.write_event = AsyncMock()
+        replacement.read_event = AsyncMock(
+            return_value=Event(type="info", data={"tts": []})
+        )
+        with patch("wyoming_client.AsyncTcpClient", return_value=replacement):
+            client.connect()
+
+        new_loop = client._loop
+        assert new_loop is not None
+        assert new_loop is not released_loop
+        assert not new_loop.is_closed()
+        assert client.is_connected() is True
+        client.disconnect()
+
 
 class TestSynthesizeRawPcm:
     def test_synthesize_returns_raw_pcm_without_wav_header(self):
@@ -139,6 +209,44 @@ class TestSynthesizeRawPcm:
         assert result == pcm
         assert not result.startswith(b"RIFF")
         assert client.audio_format == (22050, 2, 1)
+
+    def test_reconnect_after_synthesis_error_invalidates_stale_connection(self):
+        from wyoming.audio import AudioChunk
+        from wyoming.event import Event
+
+        client = WyomingPiperClient(timeout=0.1)
+        failed = MagicMock()
+        failed.write_event = AsyncMock()
+        failed.disconnect = AsyncMock()
+        failed.read_event = AsyncMock(
+            side_effect=[Event(type="error", data={"text": "synthesis failed"})]
+        )
+        client._client = failed
+
+        with pytest.raises(WyomingServerError, match="synthesis failed"):
+            client.synthesize("first")
+        assert client.is_connected() is False
+        failed.disconnect.assert_awaited_once_with()
+
+        replacement = MagicMock()
+        replacement.connect = AsyncMock()
+        replacement.disconnect = AsyncMock()
+        replacement.write_event = AsyncMock()
+        replacement.read_event = AsyncMock(
+            side_effect=[
+                Event(type="info", data={}),
+                Event(type="audio-start", data={"rate": 16000, "width": 2, "channels": 1}),
+                AudioChunk(audio=b"replacement", rate=16000, width=2, channels=1).event(),
+                Event(type="audio-stop", data={}),
+            ]
+        )
+        with patch("wyoming_client.AsyncTcpClient", return_value=replacement) as constructor:
+            result = client.synthesize("second")
+
+        assert result == b"replacement"
+        assert client.audio_format == (16000, 2, 1)
+        constructor.assert_called_once()
+        client.disconnect()
 
 
 class TestSynthesizeStreamErrors:

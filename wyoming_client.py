@@ -74,6 +74,32 @@ class WyomingPiperClient:
             self._loop = asyncio.new_event_loop()
         return self._loop
 
+    def _detach_client(
+        self,
+    ) -> Tuple[AsyncTcpClient | None, asyncio.AbstractEventLoop | None]:
+        client = self._client
+        loop = self._loop
+        self._client = None
+        self._info = None
+        self._voices = None
+        self._audio_format = None
+        return client, loop
+
+    async def _close_client(self, client: AsyncTcpClient) -> None:
+        try:
+            await asyncio.wait_for(client.disconnect(), timeout=self.timeout)
+        except (OSError, RuntimeError, TimeoutError, WyomingError) as error:
+            logger.debug("Failed to disconnect Wyoming client: %s", error)
+
+    def _invalidate_client(self) -> None:
+        client, loop = self._detach_client()
+        if client is None or loop is None or loop.is_closed():
+            return
+        try:
+            loop.run_until_complete(self._close_client(client))
+        except (OSError, RuntimeError, WyomingError) as error:
+            logger.debug("Failed to invalidate Wyoming client: %s", error)
+
     def connect(self) -> None:
         """Establish TCP connection and query server capabilities."""
         with self._lock:
@@ -89,24 +115,24 @@ class WyomingPiperClient:
                     connect_timeout=self.timeout,
                     read_timeout=self.timeout,
                 )
-                await client.connect()
-
-                # Send describe to get server capabilities
-                await client.write_event(Event(type="describe"))
-                info_event = await client.read_event()
-                if info_event is None or info_event.type != "info":
-                    raise WyomingConnectionError(
-                        f"Expected 'info' event, got: {info_event.type if info_event else 'None'}"
-                    )
-
-                return client, info_event
+                try:
+                    await client.connect()
+                    await client.write_event(Event(type="describe"))
+                    info_event = await client.read_event()
+                    if info_event is None or info_event.type != "info":
+                        raise WyomingConnectionError(
+                            f"Expected 'info' event, got: {info_event.type if info_event else 'None'}"
+                        )
+                    voices = self._parse_voices_from_info(info_event.data)
+                    return client, info_event, voices
+                except BaseException:
+                    await self._close_client(client)
+                    raise
 
             try:
-                self._client, info_event = loop.run_until_complete(_connect())
+                self._client, info_event, voices = loop.run_until_complete(_connect())
                 self._info = info_event.data
-
-                # Parse voices from info event
-                self._voices = self._parse_voices_from_info(self._info)
+                self._voices = voices
 
                 logger.info("Connected to Wyoming server at %s:%d", self.host, self.port)
                 logger.info(
@@ -115,7 +141,7 @@ class WyomingPiperClient:
                     [v.name for v in self._voices[:5]],
                 )
             except Exception as e:
-                self._client = None
+                self._detach_client()
                 if isinstance(e, WyomingConnectionError):
                     raise
                 raise WyomingConnectionError(
@@ -138,22 +164,23 @@ class WyomingPiperClient:
     def disconnect(self) -> None:
         """Close the TCP connection."""
         with self._lock:
-            if self._client is not None:
-                loop = self._get_loop()
-
-                async def _disconnect():
-                    if self._client:
-                        await self._client.disconnect()
-
+            client = self._client
+            loop = self._loop
+            try:
+                if client is not None and loop is not None and not loop.is_closed():
+                    loop.run_until_complete(self._close_client(client))
+            except (OSError, WyomingError) as error:
+                logger.debug("Disconnect failed: %s", error)
+            finally:
+                self._detach_client()
                 try:
-                    loop.run_until_complete(_disconnect())
-                except WyomingError as e:
-                    logger.debug("Disconnect failed: %s", e)
-                self._client = None
-                self._voices = None
-                self._info = None
-                self._audio_format = None
-                logger.info("Disconnected from Wyoming server")
+                    if loop is not None and not loop.is_closed():
+                        loop.close()
+                except (OSError, RuntimeError) as error:
+                    logger.debug("Event loop cleanup failed: %s", error)
+                finally:
+                    self._loop = None
+            logger.info("Disconnected from Wyoming server")
 
     def describe(self) -> List[WyomingVoice]:
         """Get available voices (cached from connect)."""
@@ -174,17 +201,17 @@ class WyomingPiperClient:
         """Synthesize text to raw PCM audio bytes. Format (rate, width, channels) is available via the audio_format property."""
         with self._lock:
             self.connect()
+            client = self._client
             loop = self._get_loop()
+            assert client is not None
 
             async def _synthesize():
-                assert self._client is not None
-
                 synthesize_voice = None
                 if voice:
                     synthesize_voice = SynthesizeVoice(name=voice)
 
                 synthesize = Synthesize(text=text, voice=synthesize_voice)
-                await self._client.write_event(synthesize.event())
+                await client.write_event(synthesize.event())
 
                 audio_chunks: List[bytes] = []
                 sample_rate = 22050
@@ -192,7 +219,7 @@ class WyomingPiperClient:
                 channels = 1
 
                 while True:
-                    event = await self._client.read_event()
+                    event = await client.read_event()
                     if event is None:
                         raise WyomingServerError("Connection closed during synthesis")
 
@@ -219,6 +246,7 @@ class WyomingPiperClient:
             try:
                 return loop.run_until_complete(_synthesize())
             except Exception as e:
+                self._invalidate_client()
                 if isinstance(e, WyomingServerError):
                     raise
                 raise WyomingServerError(f"Synthesis failed: {e}") from e

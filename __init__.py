@@ -21,6 +21,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 import wave
@@ -93,6 +94,7 @@ class WyomingPiperProvider(TTSProvider):
         self._output_format = normalized_format
         self._voice_compatible = voice_compatible
         self._client = None
+        self._client_lock = threading.Lock()
         self._voices: List[Dict[str, Any]] | None = None
 
     @property
@@ -100,17 +102,18 @@ class WyomingPiperProvider(TTSProvider):
         return self._name
 
     def _get_client(self):
-        if self._client is not None:
+        with self._client_lock:
+            if self._client is not None:
+                return self._client
+
+            from .wyoming_client import WyomingPiperClient
+
+            self._client = WyomingPiperClient(
+                host=self._host,
+                port=self._port,
+                timeout=self._timeout,
+            )
             return self._client
-
-        from .wyoming_client import WyomingPiperClient
-
-        self._client = WyomingPiperClient(
-            host=self._host,
-            port=self._port,
-            timeout=self._timeout,
-        )
-        return self._client
 
     def list_voices(self) -> List[Dict[str, Any]]:
         if self._voices is not None:
@@ -549,12 +552,14 @@ class WyomingPiperProvider(TTSProvider):
             logger.debug("Warm-up failed: %s", e)
 
     def release(self) -> None:
-        if self._client is not None:
+        with self._client_lock:
+            client = self._client
+            self._client = None
+        if client is not None:
             try:
-                self._client.disconnect()
+                client.disconnect()
             except WyomingError as e:
                 logger.debug("Disconnect failed during release: %s", e)
-            self._client = None
 
     @property
     def voice_compatible(self) -> bool:
