@@ -10,7 +10,12 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
-from wyoming_client import WyomingError, WyomingServerError, WyomingVoice
+from wyoming_client import (
+    SynthesisResult,
+    WyomingError,
+    WyomingServerError,
+    WyomingVoice,
+)
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -210,8 +215,9 @@ class TestRequestId:
         fixed_uuid = "12345678-1234-1234-1234-123456789abc"
         p = WyomingPiperProvider()
         mock_client = MagicMock()
-        mock_client.synthesize.return_value = b""
-        mock_client.audio_format = (22050, 2, 1)
+        mock_client.synthesize_result.return_value = SynthesisResult(
+            b"PCM", (22050, 2, 1)
+        )
         p._client = mock_client
 
         with patch("uuid.uuid4", return_value=fixed_uuid), \
@@ -227,10 +233,60 @@ class TestPipeModeRawPcm:
     def _provider_with_client(pcm, fmt=(22050, 2, 1)):
         p = WyomingPiperProvider()
         mock_client = MagicMock()
-        mock_client.synthesize.return_value = pcm
-        mock_client.audio_format = fmt
+        mock_client.synthesize_result.return_value = SynthesisResult(pcm, fmt)
         p._client = mock_client
         return p
+
+    def test_pipe_empty_audio_raises_before_output(self, tmp_path):
+        p = self._provider_with_client(b"")
+        with patch.object(p, "_write_wav") as mock_wav, \
+             patch.object(p, "_pipe_pcm_to_format") as mock_pipe, \
+             pytest.raises(WyomingServerError, match="Server returned no audio"):
+            p._synthesize_pipe(
+                "req1", "hello", str(tmp_path / "out.wav"),
+                voice="v", format="wav",
+            )
+        mock_wav.assert_not_called()
+        mock_pipe.assert_not_called()
+
+    def test_concurrent_pipe_formats_stay_atomic(self, tmp_path):
+        p = WyomingPiperProvider(voice="v")
+        mock_client = MagicMock()
+        barrier = threading.Barrier(2)
+        errors = []
+
+        def synthesize_result(text, voice=None):
+            barrier.wait(timeout=1)
+            rate = 16000 if text == "low" else 22050
+            return SynthesisResult(b"\x00\x00" * 20, (rate, 2, 1))
+
+        mock_client.synthesize_result.side_effect = synthesize_result
+        p._client = mock_client
+
+        def synthesize(text, output_name):
+            try:
+                p._synthesize_pipe(
+                    "req", text, str(tmp_path / output_name),
+                    voice="v", format="wav",
+                )
+            except Exception as error:  # noqa: BLE001
+                errors.append(error)
+
+        threads = [
+            threading.Thread(target=synthesize, args=("low", "low.wav")),
+            threading.Thread(target=synthesize, args=("high", "high.wav")),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=1)
+
+        assert all(not thread.is_alive() for thread in threads)
+        assert errors == []
+        with wave.open(str(tmp_path / "low.wav"), "rb") as wav_file:
+            assert wav_file.getframerate() == 16000
+        with wave.open(str(tmp_path / "high.wav"), "rb") as wav_file:
+            assert wav_file.getframerate() == 22050
 
     def test_pipe_mp3_feeds_raw_pcm_to_ffmpeg(self, tmp_path):
         p = self._provider_with_client(b"RAWPCM")
@@ -431,6 +487,34 @@ class TestStreamLifecycle:
         assert proc.wait.called
         assert all(not worker.is_alive() for worker in workers)
 
+    def test_stream_to_file_rejects_format_change_before_output(self, tmp_path):
+        p = WyomingPiperProvider()
+        mock_client = MagicMock()
+        mock_client.synthesize_stream.return_value = iter([
+            (b"first", (16000, 2, 1)),
+            (b"second", (22050, 2, 1)),
+        ])
+        p._client = mock_client
+        with patch.object(p, "_write_wav") as mock_wav, \
+             pytest.raises(WyomingServerError, match="stream format changed"):
+            p._synthesize_stream_to_file(
+                "req", "hello", str(tmp_path / "out.wav"),
+                voice="v", format="wav",
+            )
+        mock_wav.assert_not_called()
+
+    def test_direct_stream_rejects_format_change(self):
+        p = self._streamable_provider()
+        p._client.synthesize_stream.return_value = iter([
+            (b"first", (16000, 2, 1)),
+            (b"second", (22050, 2, 1)),
+        ])
+        proc = self._proc_mock()
+        with patch("subprocess.Popen", return_value=proc), \
+             pytest.raises(WyomingServerError, match="stream format changed"):
+            list(p.stream("hello"))
+        assert proc.stdin.close.called
+
     def test_source_iterator_exception_propagates_from_stream(self):
         """A WyomingServerError from the wyoming client mid-stream must reach
         the consumer while the process is still reaped."""
@@ -494,8 +578,9 @@ class TestOutputFormatIsUsed:
     def _provider_with_client(configured_format):
         p = WyomingPiperProvider(output_format=configured_format)
         mock_client = MagicMock()
-        mock_client.synthesize.return_value = b"RAWPCM"
-        mock_client.audio_format = (22050, 2, 1)
+        mock_client.synthesize_result.return_value = SynthesisResult(
+            b"RAWPCM", (22050, 2, 1)
+        )
         p._client = mock_client
         return p
 
@@ -901,6 +986,16 @@ class TestStreamFfmpegFailure:
             gen = p.stream("hello")
             next(gen)
             gen.close()  # must not raise
+
+    def test_stream_empty_audio_raises(self):
+        p = WyomingPiperProvider()
+        mock_client = MagicMock()
+        mock_client.synthesize_stream.return_value = iter([])
+        with patch.object(p, "_get_client", return_value=mock_client), \
+             patch("subprocess.Popen") as popen, \
+             pytest.raises(WyomingServerError, match="Server returned no audio"):
+            list(p.stream("hello"))
+        popen.assert_not_called()
 
     def test_stream_to_file_empty_stream_raises(self):
         p = WyomingPiperProvider()

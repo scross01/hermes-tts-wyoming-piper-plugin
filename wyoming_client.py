@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+from dataclasses import dataclass
 from queue import Empty, Full, Queue
 from threading import Thread
 from typing import Any, Dict, Iterator, List, Self, Tuple
@@ -36,6 +37,12 @@ class WyomingConnectionError(WyomingError):
 
 class WyomingServerError(WyomingError):
     """Server returned an error."""
+
+
+@dataclass(frozen=True)
+class SynthesisResult:
+    audio: bytes
+    audio_format: Tuple[int, int, int]
 
 
 class WyomingVoice:
@@ -197,7 +204,7 @@ class WyomingPiperClient:
 
     @property
     def audio_format(self) -> Tuple[int, int, int] | None:
-        """Last known audio format (rate, width, channels) from synthesis."""
+        """Last-known diagnostic format; it is not request-atomic."""
         return self._audio_format
 
     @staticmethod
@@ -215,7 +222,15 @@ class WyomingPiperClient:
         text: str,
         voice: str | None = None,
     ) -> bytes:
-        """Synthesize text to raw PCM audio bytes. Format (rate, width, channels) is available via the audio_format property."""
+        """Synthesize text to raw PCM audio bytes."""
+        return self.synthesize_result(text, voice=voice).audio
+
+    def synthesize_result(
+        self,
+        text: str,
+        voice: str | None = None,
+    ) -> SynthesisResult:
+        """Synthesize text and return audio with its request-local format."""
         with self._lock:
             self.connect()
             client = self._client
@@ -248,21 +263,29 @@ class WyomingPiperClient:
 
                     elif event.type == "audio-chunk":
                         chunk = AudioChunk.from_event(event)
+                        if not chunk.audio:
+                            continue
                         received_bytes = self._account_pcm_bytes(
                             received_bytes, len(chunk.audio)
                         )
                         audio_chunks.append(chunk.audio)
 
                     elif event.type == "audio-stop" or event.type == "synthesize-stopped":
+                        if received_bytes == 0:
+                            raise WyomingServerError("Server returned no audio")
                         break
 
                     elif event.type == "error":
                         error_msg = event.data.get("text", "Unknown error")
                         raise WyomingServerError(f"Synthesis error: {error_msg}")
 
-                self._audio_format = (sample_rate, sample_width, channels)
+                audio_format = (sample_rate, sample_width, channels)
+                self._audio_format = audio_format
 
-                return b"".join(audio_chunks)
+                return SynthesisResult(
+                    audio=b"".join(audio_chunks),
+                    audio_format=audio_format,
+                )
 
             async def _synthesize_with_deadline():
                 try:
@@ -358,6 +381,8 @@ class WyomingPiperClient:
                                 if cancelled.is_set():
                                     break
                                 chunk = AudioChunk.from_event(event)
+                                if not chunk.audio:
+                                    continue
                                 received_bytes = self._account_pcm_bytes(
                                     received_bytes, len(chunk.audio)
                                 )
@@ -370,6 +395,8 @@ class WyomingPiperClient:
                                 format_sent = True
 
                             elif event.type == "audio-stop" or event.type == "synthesize-stopped":
+                                if received_bytes == 0:
+                                    raise WyomingServerError("Server returned no audio")
                                 break
                             elif event.type == "error":
                                 error_msg = event.data.get("text", "Unknown error")

@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from wyoming_client import (
+    SynthesisResult,
     WyomingError,
     WyomingPiperClient,
     WyomingServerError,
@@ -210,6 +211,71 @@ class TestSynthesizeRawPcm:
         assert not result.startswith(b"RIFF")
         assert client.audio_format == (22050, 2, 1)
 
+    def test_synthesize_result_keeps_audio_and_format_together(self):
+        from wyoming.audio import AudioChunk
+        from wyoming.event import Event
+
+        client = WyomingPiperClient()
+        pcm = b"\x01\x02" * 8
+        mock_conn = MagicMock()
+        mock_conn.write_event = AsyncMock()
+        mock_conn.disconnect = AsyncMock()
+        mock_conn.read_event = AsyncMock(
+            side_effect=[
+                Event(type="audio-start", data={"rate": 16000, "width": 2, "channels": 1}),
+                AudioChunk(audio=pcm, rate=16000, width=2, channels=1).event(),
+                Event(type="audio-stop", data={}),
+            ]
+        )
+        client._client = mock_conn
+
+        result = client.synthesize_result("hello")
+
+        assert result == SynthesisResult(pcm, (16000, 2, 1))
+        client.disconnect()
+
+    def test_synthesis_empty_audio_raises(self):
+        from wyoming.event import Event
+
+        client = WyomingPiperClient(timeout=0.1)
+        mock_conn = MagicMock()
+        mock_conn.write_event = AsyncMock()
+        mock_conn.disconnect = AsyncMock()
+        mock_conn.read_event = AsyncMock(
+            side_effect=[
+                Event(type="audio-start", data={"rate": 22050, "width": 2, "channels": 1}),
+                Event(type="audio-stop", data={}),
+            ]
+        )
+        client._client = mock_conn
+
+        with pytest.raises(WyomingServerError, match="Server returned no audio"):
+            client.synthesize("hello")
+
+        assert client.is_connected() is False
+        mock_conn.disconnect.assert_awaited_once_with()
+
+    def test_synthesis_zero_length_chunk_then_audio_succeeds(self):
+        from wyoming.audio import AudioChunk
+        from wyoming.event import Event
+
+        client = WyomingPiperClient()
+        mock_conn = MagicMock()
+        mock_conn.write_event = AsyncMock()
+        mock_conn.disconnect = AsyncMock()
+        mock_conn.read_event = AsyncMock(
+            side_effect=[
+                Event(type="audio-start", data={"rate": 22050, "width": 2, "channels": 1}),
+                AudioChunk(audio=b"", rate=22050, width=2, channels=1).event(),
+                AudioChunk(audio=b"\x01\x02", rate=22050, width=2, channels=1).event(),
+                Event(type="audio-stop", data={}),
+            ]
+        )
+        client._client = mock_conn
+
+        assert client.synthesize("hello") == b"\x01\x02"
+        client.disconnect()
+
     def test_reconnect_after_synthesis_error_invalidates_stale_connection(self):
         from wyoming.audio import AudioChunk
         from wyoming.event import Event
@@ -319,6 +385,46 @@ class TestSynthesizeStreamErrors:
         with patch("wyoming_client.AsyncTcpClient", return_value=mock_conn), \
              pytest.raises(WyomingError):
             list(client.synthesize_stream("hello"))
+
+    def test_stream_empty_audio_raises(self):
+        from wyoming.event import Event
+
+        client = WyomingPiperClient(timeout=0.1)
+        mock_conn = MagicMock()
+        mock_conn.connect = AsyncMock()
+        mock_conn.disconnect = AsyncMock()
+        mock_conn.write_event = AsyncMock()
+        mock_conn.read_event = AsyncMock(
+            side_effect=[
+                Event(type="audio-start", data={"rate": 22050, "width": 2, "channels": 1}),
+                Event(type="audio-stop", data={}),
+            ]
+        )
+        with patch("wyoming_client.AsyncTcpClient", return_value=mock_conn), \
+             pytest.raises(WyomingServerError, match="Server returned no audio"):
+            list(client.synthesize_stream("hello"))
+        mock_conn.disconnect.assert_awaited_once_with()
+
+    def test_stream_zero_length_chunk_then_audio_succeeds(self):
+        from wyoming.audio import AudioChunk
+        from wyoming.event import Event
+
+        client = WyomingPiperClient()
+        mock_conn = MagicMock()
+        mock_conn.connect = AsyncMock()
+        mock_conn.disconnect = AsyncMock()
+        mock_conn.write_event = AsyncMock()
+        mock_conn.read_event = AsyncMock(
+            side_effect=[
+                Event(type="audio-start", data={"rate": 22050, "width": 2, "channels": 1}),
+                AudioChunk(audio=b"", rate=22050, width=2, channels=1).event(),
+                AudioChunk(audio=b"\x01\x02", rate=22050, width=2, channels=1).event(),
+                Event(type="audio-stop", data={}),
+            ]
+        )
+        with patch("wyoming_client.AsyncTcpClient", return_value=mock_conn):
+            items = list(client.synthesize_stream("hello"))
+        assert items == [(b"\x01\x02", (22050, 2, 1))]
 
     def test_midstream_error_event_raises_wyoming_server_error(self):
         from wyoming.event import Event
@@ -533,23 +639,31 @@ class TestThreadSafety:
         """Two threads calling synthesize() must never overlap inside the
         event-loop section. Without the lock, both threads would routinely be
         inside read_event at once; with it, max_in_flight stays at 1."""
+        from wyoming.audio import AudioChunk
         from wyoming.event import Event
 
         client = WyomingPiperClient()
-        state = {"in_flight": 0, "max": 0}
+        state = {"in_flight": 0, "max": 0, "reads": 0}
         lock_for_state = threading.Lock()
 
         async def slow_read(*args, **kwargs):
             with lock_for_state:
                 state["in_flight"] += 1
                 state["max"] = max(state["max"], state["in_flight"])
+                state["reads"] += 1
+                read_number = state["reads"]
             await asyncio.sleep(0.05)
             with lock_for_state:
                 state["in_flight"] -= 1
+            if read_number % 2:
+                return AudioChunk(
+                    audio=b"\x01\x02", rate=22050, width=2, channels=1
+                ).event()
             return Event(type="audio-stop", data={})
 
         mock_conn = MagicMock()
         mock_conn.write_event = AsyncMock()
+        mock_conn.disconnect = AsyncMock()
         mock_conn.read_event = AsyncMock(side_effect=slow_read)
         client._client = mock_conn  # skips connect(); loop section still runs
 
@@ -563,6 +677,7 @@ class TestThreadSafety:
             t.join()
 
         assert state["max"] == 1
+        client.disconnect()
 
     def test_successful_stream_still_yields(self):
         """Guard: the broadened except must not change the happy path."""

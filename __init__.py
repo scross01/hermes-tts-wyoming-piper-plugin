@@ -121,6 +121,15 @@ class WyomingPiperProvider(TTSProvider):
             )
             return self._client
 
+    @staticmethod
+    def _first_stream_audio(
+        stream_iter: Iterator[Any],
+    ) -> tuple[bytes, tuple[int, int, int] | None]:
+        for pcm_bytes, audio_format in stream_iter:
+            if pcm_bytes:
+                return pcm_bytes, audio_format
+        raise WyomingServerError("Server returned no audio")
+
     def list_voices(self) -> List[Dict[str, Any]]:
         if self._voices is not None:
             return self._voices
@@ -185,17 +194,18 @@ class WyomingPiperProvider(TTSProvider):
         target_ext = self._target_extension(format)
 
         t0 = time.monotonic()
-        pcm_bytes = client.synthesize(text, voice=voice_name)
+        result = client.synthesize_result(text, voice=voice_name)
+        if not result.audio:
+            raise WyomingServerError("Server returned no audio")
         elapsed = time.monotonic() - t0
 
         _debug(
-            f"[{request_id}] received {len(pcm_bytes)} bytes in {elapsed:.2f}s, "
+            f"[{request_id}] received {len(result.audio)} bytes in {elapsed:.2f}s, "
             f"voice={voice_name}"
         )
 
-        # Get audio format from client
-        fmt = client.audio_format or (22050, 2, 1)
-        rate, width, channels = fmt
+        rate, width, channels = result.audio_format
+        pcm_bytes = result.audio
 
         # If target is wav or pcm, write directly
         if target_ext in ("wav", "pcm"):
@@ -519,23 +529,17 @@ class WyomingPiperProvider(TTSProvider):
         t0 = time.monotonic()
 
         stream_iter = client.synthesize_stream(text, voice=voice_name)
-        try:
-            first_chunk, fmt_info = next(stream_iter)
-        except StopIteration as e:
-            raise WyomingServerError("Server returned no audio") from e
-        audio_fmt = fmt_info
-
-        def pcm_iter():
-            nonlocal audio_fmt
-            yield first_chunk
-            for pcm_bytes, fmt_info in stream_iter:
-                if fmt_info is not None:
-                    audio_fmt = fmt_info
-                yield pcm_bytes
-
+        first_chunk, audio_fmt = self._first_stream_audio(stream_iter)
         if audio_fmt is None:
             audio_fmt = (22050, 2, 1)
         rate, width, channels = audio_fmt
+
+        def pcm_iter():
+            yield first_chunk
+            for pcm_bytes, fmt_info in stream_iter:
+                if fmt_info is not None and fmt_info != audio_fmt:
+                    raise WyomingServerError("Synthesis stream format changed")
+                yield pcm_bytes
 
         if target_ext in ("wav", "pcm"):
             wav_path = output_path if output_path.endswith(".wav") else output_path.rsplit(".", 1)[0] + ".wav"
@@ -579,10 +583,7 @@ class WyomingPiperProvider(TTSProvider):
 
         # Read first chunk to determine actual audio format before starting ffmpeg
         stream_iter = client.synthesize_stream(text, voice=voice_name)
-        try:
-            first_chunk, fmt_info = next(stream_iter)
-        except StopIteration:
-            return
+        first_chunk, fmt_info = self._first_stream_audio(stream_iter)
 
         if fmt_info is not None:
             rate, width, channels = fmt_info
@@ -680,8 +681,8 @@ class WyomingPiperProvider(TTSProvider):
                 return
 
             for pcm_bytes, fmt_info in stream_iter:
-                if fmt_info is not None:
-                    _debug(f"stream: format={fmt_info}")
+                if fmt_info is not None and fmt_info != (rate, width, channels):
+                    raise WyomingServerError("Synthesis stream format changed")
                 yield from _drain_input_backpressure()
                 if not self._put_with_cancellation(
                     write_queue, pcm_bytes, writer_cancelled
